@@ -244,6 +244,15 @@ typedef struct SqliteFdwRelationInfo
 
 	/* Function pushdown surppot in target list */
 	bool		is_tlist_func_pushdown;
+
+	/* Semijoin pushdown support */
+	bool		is_semijoin_pushdown_safe;	/* Can we push down a semijoin? */
+	int			semijoin_outer_relid;		/* Relid of the outer (local) relation */
+	List	   *semijoin_join_conds;		/* Join conditions for the semijoin */
+	char	   *semijoin_column_name;		/* Name of the join column */
+	int64		semijoin_num_keys;			/* Number of keys collected */
+	char	   *semijoin_keys_binary;		/* Binary-compressed key data (delta+varint encoding) */
+	int64		semijoin_keys_binary_size;	/* Size of binary data in bytes */
 }			SqliteFdwRelationInfo;
 
 /*

@@ -1312,6 +1312,13 @@ sqlite_get_jointype_name(JoinType jointype)
 		case JOIN_FULL:
 			return "FULL";
 
+		case JOIN_SEMI:
+			/* 
+			 * DuckDB supports native SEMI JOIN syntax.
+			 * This is more efficient than INNER JOIN + DISTINCT.
+			 */
+			return "SEMI";
+
 		default:
 			/* Shouldn't come here, but protect from buggy code. */
 			elog(ERROR, "unsupported join type %d", jointype);
@@ -3401,6 +3408,23 @@ sqlite_append_order_by_clause(List *pathkeys, bool has_final_sort, deparse_expr_
 	char	   *delim = " ";
 	RelOptInfo *baserel = context->scanrel;
 	StringInfo	buf = context->buf;
+	
+	/* Check if this is a SEMI/ANTI join and get outer relation's relids */
+	bool is_semijoin = false;
+	Relids outer_relids = NULL;
+	
+	if (IS_JOIN_REL(context->foreignrel))
+	{
+		SqliteFdwRelationInfo *fpinfo = (SqliteFdwRelationInfo *) context->foreignrel->fdw_private;
+		JoinType jointype = fpinfo->jointype;
+		is_semijoin = (jointype == JOIN_SEMI || jointype == JOIN_ANTI);
+		
+		if (is_semijoin)
+		{
+			/* For SEMI/ANTI joins, we need the outer (left) relation's relids */
+			outer_relids = fpinfo->outerrel->relids;
+		}
+	}
 
 	/* Make sure any constants in the exprs are printed portably */
 	nestlevel = sqlite_set_transmission_modes();
@@ -3409,24 +3433,80 @@ sqlite_append_order_by_clause(List *pathkeys, bool has_final_sort, deparse_expr_
 	foreach(lcell, pathkeys)
 	{
 		PathKey    *pathkey = lfirst(lcell);
-		Expr	   *em_expr;
+		Expr	   *em_expr = NULL;
 		int			sqliteVersion = sqlite3_libversion_number();
 
-		if (has_final_sort)
+		/*
+		 * For SEMI/ANTI joins, ensure ORDER BY expressions only reference
+		 * the outer (visible) relation. Inner relation columns are not
+		 * accessible after a SEMI/ANTI join.
+		 */
+		if (is_semijoin)
 		{
-			/*
-			 * By construction, context->foreignrel is the input relation to
-			 * the final sort.
-			 */
-			em_expr = sqlite_find_em_expr_for_input_target(context->root,
-														   pathkey->pk_eclass,
-														   context->foreignrel->reltarget,
-														   baserel);
+			/* Try to find an expression that belongs to the equivalence class */
+			em_expr = sqlite_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+			
+			if (em_expr != NULL)
+			{
+				Relids expr_relids = pull_varnos(context->root, (Node *) em_expr);
+				
+				/* For SEMI/ANTI join, expression must ONLY reference the outer relation */
+				if (!bms_is_subset(expr_relids, outer_relids))
+				{
+					/* Expression references inner or other relations; skip this pathkey */
+					continue;
+				}
+			}
+			else
+			{
+				/* No suitable expression found for this pathkey; skip it */
+				continue;
+			}
+		}
+		else if (IS_JOIN_REL(context->foreignrel))
+		{
+			/* Regular join handling */
+			if (has_final_sort)
+			{
+				em_expr = sqlite_find_em_expr_for_input_target(context->root,
+															   pathkey->pk_eclass,
+															   context->foreignrel->reltarget,
+															   baserel);
+			}
+			else
+				em_expr = sqlite_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+				
+			/* Verify the expression only references visible relations */
+			if (em_expr != NULL)
+			{
+				Relids expr_relids = pull_varnos(context->root, (Node *) em_expr);
+				if (!bms_is_subset(expr_relids, baserel->relids))
+				{
+					Expr *alt = sqlite_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+					if (alt)
+						em_expr = alt;
+					else
+						continue;
+				}
+			}
 		}
 		else
-			em_expr = sqlite_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+		{
+			/* Simple base relation */
+			if (has_final_sort)
+			{
+				em_expr = sqlite_find_em_expr_for_input_target(context->root,
+															   pathkey->pk_eclass,
+															   context->foreignrel->reltarget,
+															   baserel);
+			}
+			else
+				em_expr = sqlite_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+		}
 
-		Assert(em_expr != NULL);
+		/* Skip if we couldn't find a valid expression */
+		if (em_expr == NULL)
+			continue;
 
 		appendStringInfoString(buf, delim);
 		sqlite_deparse_expr(em_expr, context);

@@ -66,6 +66,8 @@
 #include "parser/parsetree.h"
 #include "utils/typcache.h"
 #include "utils/selfuncs.h"
+#include "executor/spi.h"
+#include "catalog/namespace.h"
 
 extern PGDLLEXPORT void _PG_init(void);
 
@@ -129,7 +131,25 @@ enum FdwScanPrivateIndex
 	 * String describing join i.e. names of relations being joined and types
 	 * of join, added when the scan is join
 	 */
-	FdwScanPrivateRelations
+	FdwScanPrivateRelations,
+	
+	/*
+	 * Integer indicating if this scan is part of a semijoin (1) or not (0).
+	 * Added to enable semijoin pushdown optimizations.
+	 */
+	FdwScanPrivateSemijoinMarker,
+	
+	/* String: Name of the join column for semijoin */
+	FdwScanPrivateSemijoinColumnName,
+	
+	/* Integer: Number of keys in semijoin */
+	FdwScanPrivateSemijoinNumKeys,
+	
+	/* Integer: Size of binary encoded keys data */
+	FdwScanPrivateSemijoinBinarySize,
+	
+	/* String: Binary encoded keys data (as bytea) */
+	FdwScanPrivateSemijoinBinaryData
 };
 
 /*
@@ -510,6 +530,625 @@ sqlite_prepare_wrapper(ForeignServer *server, sqlite3 *db, char *query, sqlite3_
 }
 
 /*
+ * extract_join_column_name
+ *
+ * Extract the column name from a semijoin expression.
+ * For a semijoin like: a1.index_column = a2.index_column
+ * This extracts "index_column" from the local table side.
+ *
+ * Parameters:
+ *   - root: PlannerInfo for accessing range table
+ *   - sjinfo: SpecialJoinInfo containing join information
+ *   - local_relid: The relation ID of the local table
+ *   - foreign_relid: The relation ID of the foreign table  
+ *
+ * Returns: palloc'd string containing column name, or NULL if not found
+ */
+static char *
+extract_join_column_name(PlannerInfo *root, SpecialJoinInfo *sjinfo, 
+						 Index local_relid, Index foreign_relid)
+{
+	ListCell *lc;
+	RangeTblEntry *local_rte;
+	char *colname;
+	
+	/* First try semi_rhs_exprs */
+	if (sjinfo->semi_rhs_exprs != NIL)
+	{
+		foreach(lc, sjinfo->semi_rhs_exprs)
+		{
+			Expr *expr = (Expr *) lfirst(lc);
+			
+			/* Check if it's a Var belonging to local table */
+			if (IsA(expr, Var))
+			{
+				Var *var = (Var *) expr;
+				if (var->varno == local_relid)
+				{
+					local_rte = planner_rt_fetch(local_relid, root);
+					colname = get_attname(local_rte->relid, var->varattno, false);
+					if (colname)
+					{
+						elog(DEBUG1, "Extracted join column from semi_rhs_exprs: %s", colname);
+						return pstrdup(colname);
+					}
+				}
+			}
+		}
+	}
+	
+	/* If that didn't work, look at the min_lefthand and min_righthand equivalence classes */
+	/* Search through root->eq_classes for equivalences involving both tables */
+	if (root->eq_classes != NIL)
+	{
+		foreach(lc, root->eq_classes)
+		{
+			EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc);
+			ListCell *lc2;
+			Var *local_var = NULL;
+			Var *foreign_var = NULL;
+			
+			/* Look for members from both local and foreign tables */
+			foreach(lc2, ec->ec_members)
+			{
+				EquivalenceMember *em = (EquivalenceMember *) lfirst(lc2);
+				
+				if (IsA(em->em_expr, Var))
+				{
+					Var *var = (Var *) em->em_expr;
+					
+					if (var->varno == local_relid)
+						local_var = var;
+					else if (var->varno == foreign_relid)
+						foreign_var = var;
+				}
+			}
+			
+			/* If we found both, extract the column name from local table */
+			if (local_var != NULL && foreign_var != NULL)
+			{
+				local_rte = planner_rt_fetch(local_relid, root);
+				colname = get_attname(local_rte->relid, local_var->varattno, false);
+				if (colname)
+				{
+					elog(DEBUG1, "Extracted join column from equivalence class: %s", colname);
+					return pstrdup(colname);
+				}
+			}
+		}
+	}
+	
+	elog(DEBUG1, "Could not extract join column name");
+	return NULL;
+}
+
+/*
+ * sqlite_count_distinct_keys_in_local_table
+ *
+ * Helper function to count DISTINCT values in a local PostgreSQL table column.
+ * This is used to verify how many unique join keys we can collect for semi-join
+ * IN clause optimization.
+ *
+ * Parameters:
+ *   - root: PlannerInfo for accessing range table
+ *   - outer_relid: The RTE index of the local (PostgreSQL) table
+ *   - column_name: The column name to count distinct values for
+ *   - restrictions: List of RestrictInfo nodes to apply as WHERE clauses
+ *
+ * Returns: Number of distinct values, or -1 if error
+ */
+static int64
+sqlite_count_distinct_keys_in_local_table(PlannerInfo *root, Index outer_relid, 
+										  const char *column_name, List *restrictions)
+{
+	RangeTblEntry *rte;
+	char *schema_name;
+	char *table_name;
+	StringInfoData sql;
+	int ret;
+	int64 distinct_count = -1;
+	bool isnull;
+	Datum count_datum;
+	ListCell *lc;
+	bool first_where = true;
+	
+	/* Get the RTE for the outer (local) relation */
+	rte = planner_rt_fetch(outer_relid, root);
+	
+	if (rte->rtekind != RTE_RELATION)
+		return -1;
+	
+	/* Get schema and table names */
+	schema_name = get_namespace_name(get_rel_namespace(rte->relid));
+	table_name = get_rel_name(rte->relid);
+	
+	if (!schema_name || !table_name)
+		return -1;
+	
+	/* Build COUNT(DISTINCT ...) query */
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT COUNT(DISTINCT %s) FROM %s.%s",
+					 column_name, schema_name, table_name);
+	
+	/*
+	 * Add WHERE clauses from base restrictions
+	 * For now, we handle simple cases: column < constant, column > constant, etc.
+	 * TODO: Use proper deparsing for complex expressions
+	 */
+	if (restrictions != NIL)
+	{
+		foreach(lc, restrictions)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+			Expr *clause = rinfo->clause;
+			
+			if (first_where)
+			{
+				appendStringInfoString(&sql, " WHERE ");
+				first_where = false;
+			}
+			else
+			{
+				appendStringInfoString(&sql, " AND ");
+			}
+			
+			/*
+			 * Simple handling: if it's an OpExpr like "index_column < 1000",
+			 * we'll build it manually. For complex cases, we'd need proper deparsing.
+			 */
+			if (IsA(clause, OpExpr))
+			{
+				OpExpr *op = (OpExpr *) clause;
+				Node *leftarg = (Node *) linitial(op->args);
+				Node *rightarg = (Node *) lsecond(op->args);
+				char *opname = get_opname(op->opno);
+				
+				/* Left side: assume it's a Var (column reference) */
+				if (IsA(leftarg, Var))
+				{
+					Var *var = (Var *) leftarg;
+					char *colname = get_attname(rte->relid, var->varattno, false);
+					appendStringInfoString(&sql, colname);
+				}
+				
+				/* Operator */
+				appendStringInfo(&sql, " %s ", opname);
+				
+				/* Right side: assume it's a Const (literal value) */
+				if (IsA(rightarg, Const))
+				{
+					Const *con = (Const *) rightarg;
+					if (!con->constisnull)
+					{
+						Datum val = con->constvalue;
+						Oid typoutput;
+						bool typIsVarlena;
+						
+						getTypeOutputInfo(con->consttype, &typoutput, &typIsVarlena);
+						appendStringInfoString(&sql, 
+							OidOutputFunctionCall(typoutput, val));
+					}
+					else
+					{
+						appendStringInfoString(&sql, "NULL");
+					}
+				}
+			}
+			else
+			{
+				/* For other expression types, skip for now */
+			}
+		}
+	}
+	
+	/* Execute query using SPI */
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		pfree(sql.data);
+		return -1;
+	}
+	
+	ret = SPI_execute(sql.data, true /* read_only */, 0 /* count */);
+	
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		SPI_finish();
+		pfree(sql.data);
+		return -1;
+	}
+	
+	/* Get the count from the result */
+	count_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	
+	if (isnull)
+		distinct_count = -1;
+	else
+		distinct_count = DatumGetInt64(count_datum);
+	
+	SPI_finish();
+	pfree(sql.data);
+	
+	return distinct_count;
+}
+
+/*
+ * sqlite_collect_local_keys_binary
+ *
+ * Collect DISTINCT key values from a local PostgreSQL table in binary format.
+ * Uses delta encoding + variable-length integer encoding to compress the keys.
+ * This is used to build an IN clause for semi-join pushdown to DuckDB.
+ *
+ * Binary format:
+ *   - Keys are sorted and stored as deltas (difference from previous key)
+ *   - Small deltas (< 128) use 1 byte, larger deltas use variable-length encoding
+ *   - This typically achieves 4-8x compression for sequential/clustered keys
+ *
+ * STREAMING APPROACH: Encodes keys on-the-fly without storing full array in memory
+ *
+ * Parameters:
+ *   - root: PlannerInfo for accessing range table
+ *   - outer_relid: The RTE index of the local (PostgreSQL) table
+ *   - column_name: The column name to collect distinct values for
+ *   - num_keys: Output parameter - number of keys collected
+ *   - max_keys: Maximum number of keys to collect (safety limit)
+ *   - encoded_size: Output parameter - size of encoded binary data in bytes
+ *   - restrictions: List of RestrictInfo nodes to apply as WHERE clauses
+ *
+ * Returns: StringInfo containing binary-encoded keys, or NULL on error
+ *          Caller must pfree the returned StringInfo->data
+ */
+static StringInfo
+sqlite_collect_local_keys_binary(PlannerInfo *root, Index outer_relid, const char *column_name,
+								 int64 *num_keys, int64 max_keys, int64 *encoded_size, List *restrictions)
+{
+	RangeTblEntry *rte;
+	char *schema_name;
+	char *table_name;
+	StringInfoData sql;
+	StringInfo binary_data;
+	int ret;
+	uint64 i;
+	int64 prev_key = 0;
+	int64 current_key;
+	ListCell *lc;
+	bool first_where = true;
+	MemoryContext oldcontext = CurrentMemoryContext;
+	
+	*num_keys = 0;
+	*encoded_size = 0;
+	
+	/* Get the RTE for the outer (local) relation */
+	rte = planner_rt_fetch(outer_relid, root);
+	
+	if (rte->rtekind != RTE_RELATION)
+		return NULL;
+	
+	/* Get schema and table names */
+	schema_name = get_namespace_name(get_rel_namespace(rte->relid));
+	table_name = get_rel_name(rte->relid);
+	
+	if (!schema_name || !table_name)
+		return NULL;
+	
+	/* Build query to get DISTINCT keys ORDERED (for delta encoding) */
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT DISTINCT %s FROM %s.%s",
+					 column_name, schema_name, table_name);
+	
+	/*
+	 * Add WHERE clauses from base restrictions
+	 * For now, we handle simple cases: column < constant, column > constant, etc.
+	 */
+	if (restrictions != NIL)
+	{
+		elog(DEBUG1, "Applying %d WHERE restrictions to key collection",
+			 list_length(restrictions));
+		
+		foreach(lc, restrictions)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+			Expr *clause = rinfo->clause;
+			
+			if (first_where)
+			{
+				appendStringInfoString(&sql, " WHERE ");
+				first_where = false;
+			}
+			else
+			{
+				appendStringInfoString(&sql, " AND ");
+			}
+			
+			/* Simple handling for OpExpr like "index_column < 1000" */
+			if (IsA(clause, OpExpr))
+			{
+				OpExpr *op = (OpExpr *) clause;
+				Node *leftarg = (Node *) linitial(op->args);
+				Node *rightarg = (Node *) lsecond(op->args);
+				char *opname = get_opname(op->opno);
+				
+				/* Left side: assume it's a Var (column reference) */
+				if (IsA(leftarg, Var))
+				{
+					Var *var = (Var *) leftarg;
+					char *colname = get_attname(rte->relid, var->varattno, false);
+					appendStringInfoString(&sql, colname);
+				}
+				
+				/* Operator */
+				appendStringInfo(&sql, " %s ", opname);
+				
+				/* Right side: assume it's a Const (literal value) */
+				if (IsA(rightarg, Const))
+				{
+					Const *con = (Const *) rightarg;
+					if (!con->constisnull)
+					{
+						Datum val = con->constvalue;
+						Oid typoutput;
+						bool typIsVarlena;
+						
+						getTypeOutputInfo(con->consttype, &typoutput, &typIsVarlena);
+						appendStringInfoString(&sql, 
+							OidOutputFunctionCall(typoutput, val));
+					}
+					else
+					{
+						appendStringInfoString(&sql, "NULL");
+					}
+				}
+			}
+			else
+			{
+				/* For other expression types, skip for now */
+			}
+		}
+	}
+	
+	appendStringInfo(&sql, " ORDER BY %s LIMIT %ld", column_name, max_keys);
+	
+	/* Execute query using SPI */
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		pfree(sql.data);
+		return NULL;
+	}
+	
+	ret = SPI_execute(sql.data, true /* read_only */, max_keys);
+	
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		pfree(sql.data);
+		return NULL;
+	}
+	
+	*num_keys = SPI_processed;
+	
+	if (*num_keys == 0)
+	{
+		SPI_finish();
+		pfree(sql.data);
+		return NULL;
+	}
+	
+	/* Initialize binary buffer for streaming encoding in caller's context */
+	{
+		MemoryContext spi_context = MemoryContextSwitchTo(oldcontext);
+		binary_data = makeStringInfo();
+		MemoryContextSwitchTo(spi_context);
+	}
+	
+	/* Write header: number of keys (8 bytes) */
+	appendBinaryStringInfo(binary_data, (char *)num_keys, sizeof(int64));
+	
+	elog(DEBUG1, "Encoding %ld keys using delta+varint compression", *num_keys);
+	
+	/* STREAMING ENCODE: Process each key from SPI result immediately */
+	for (i = 0; i < SPI_processed; i++)
+	{
+		HeapTuple tuple = SPI_tuptable->vals[i];
+		bool isnull;
+		Datum key_datum;
+		int64 delta;
+		
+		key_datum = SPI_getbinval(tuple, SPI_tuptable->tupdesc, 1, &isnull);
+		
+		if (isnull)
+			continue;
+		
+		current_key = DatumGetInt64(key_datum);
+		delta = (i == 0) ? current_key : (current_key - prev_key);
+		
+		/* Variable-length encoding for delta:
+		 * If delta fits in 7 bits: 1 byte (0xxxxxxx)
+		 * If delta fits in 14 bits: 2 bytes (10xxxxxx xxxxxxxx)
+		 * If delta fits in 21 bits: 3 bytes (110xxxxx xxxxxxxx xxxxxxxx)
+		 * ... up to 9 bytes for full 64-bit values
+		 */
+		if (delta >= 0 && delta < 128)
+		{
+			/* 1 byte encoding */
+			unsigned char byte = (unsigned char)delta;
+			appendStringInfoChar(binary_data, byte);
+		}
+		else if (delta >= 0 && delta < 16384)
+		{
+			/* 2 byte encoding */
+			unsigned char byte1 = 0x80 | ((delta >> 8) & 0x3F);
+			unsigned char byte2 = delta & 0xFF;
+			appendStringInfoChar(binary_data, byte1);
+			appendStringInfoChar(binary_data, byte2);
+		}
+		else if (delta >= 0 && delta < 2097152)
+		{
+			/* 3 byte encoding */
+			unsigned char byte1 = 0xC0 | ((delta >> 16) & 0x1F);
+			unsigned char byte2 = (delta >> 8) & 0xFF;
+			unsigned char byte3 = delta & 0xFF;
+			appendStringInfoChar(binary_data, byte1);
+			appendStringInfoChar(binary_data, byte2);
+			appendStringInfoChar(binary_data, byte3);
+		}
+		else
+		{
+			/* 9 byte encoding (marker + full 64-bit value) */
+			unsigned char marker = 0xFF;
+			appendStringInfoChar(binary_data, marker);
+			appendBinaryStringInfo(binary_data, (char *)&delta, sizeof(int64));
+		}
+		
+		prev_key = current_key;
+		
+		/* Progress reporting every 500k keys (at DEBUG1 level) */
+		if (i > 0 && i % 500000 == 0)
+			elog(DEBUG1, "Encoded %lu keys so far (%d bytes)", i, binary_data->len);
+	}
+	
+	SPI_finish();
+	pfree(sql.data);
+	
+	*encoded_size = binary_data->len;
+	
+	elog(DEBUG1, "Binary encoding complete: %ld keys, %ld bytes (compression ratio: %.2fx)", 
+		 *num_keys, *encoded_size, (*num_keys * 8.0) / *encoded_size);
+	
+	return binary_data;
+}
+/*
+ * sqlite_decode_binary_keys_to_string
+ *
+ * Decode binary-encoded keys back to comma-separated string for IN clause.
+ *
+ * Parameters:
+ *   - binary_data: StringInfo with binary-encoded keys
+ *   - num_keys: Number of keys encoded
+ *
+ * Returns: StringInfo with comma-separated key values
+ */
+static StringInfo
+sqlite_decode_binary_keys_to_string(StringInfo binary_data, int64 num_keys)
+{
+	StringInfo key_list;
+	const char *data_ptr;
+	int64 i;
+	int64 prev_key = 0;
+	int64 current_key;
+	int64 stored_count;
+	size_t offset = 0;
+	double size_mb;
+	
+	elog(DEBUG1, "Decoding %ld binary keys to IN clause string (%d bytes)", 
+		 num_keys, binary_data->len);
+	
+	/* Read header (number of keys) */
+	if (binary_data->len < sizeof(int64))
+	{
+		elog(ERROR, "Binary data too short: %d bytes (need at least %zu for header)", 
+			 binary_data->len, sizeof(int64));
+		return NULL;
+	}
+	
+	memcpy(&stored_count, binary_data->data, sizeof(int64));
+	offset += sizeof(int64);
+	
+	if (stored_count != num_keys)
+	{
+		elog(WARNING, "  Key count mismatch: expected %ld, got %ld", num_keys, stored_count);
+	}
+	
+	key_list = makeStringInfo();
+	data_ptr = binary_data->data + offset;
+	
+	for (i = 0; i < num_keys && offset < binary_data->len; i++)
+	{
+		unsigned char first_byte = (unsigned char)data_ptr[0];
+		int64 delta;
+		
+		/* Check if we have enough bytes for the first byte */
+		if (offset >= binary_data->len)
+		{
+			elog(WARNING, "  Buffer overrun at key %ld: offset=%zu, len=%d", i, offset, binary_data->len);
+			break;
+		}
+		
+		if ((first_byte & 0x80) == 0)
+		{
+			/* 1 byte encoding */
+			delta = first_byte;
+			data_ptr += 1;
+			offset += 1;
+		}
+		else if ((first_byte & 0xC0) == 0x80)
+		{
+			/* 2 byte encoding */
+			if (offset + 2 > binary_data->len)
+			{
+				elog(WARNING, "  Buffer overrun at key %ld (2-byte encoding): need %zu bytes, have %d", 
+					 i, offset + 2, binary_data->len);
+				break;
+			}
+			delta = ((first_byte & 0x3F) << 8) | (unsigned char)data_ptr[1];
+			data_ptr += 2;
+			offset += 2;
+		}
+		else if ((first_byte & 0xE0) == 0xC0)
+		{
+			/* 3 byte encoding */
+			if (offset + 3 > binary_data->len)
+			{
+				elog(WARNING, "  Buffer overrun at key %ld (3-byte encoding): need %zu bytes, have %d", 
+					 i, offset + 3, binary_data->len);
+				break;
+			}
+			delta = ((first_byte & 0x1F) << 16) | 
+					((unsigned char)data_ptr[1] << 8) | 
+					(unsigned char)data_ptr[2];
+			data_ptr += 3;
+			offset += 3;
+		}
+		else if (first_byte == 0xFF)
+		{
+			/* 9 byte encoding */
+			if (offset + 9 > binary_data->len)
+			{
+				elog(WARNING, "  Buffer overrun at key %ld (9-byte encoding): need %zu bytes, have %d", 
+					 i, offset + 9, binary_data->len);
+				break;
+			}
+			memcpy(&delta, data_ptr + 1, sizeof(int64));
+			data_ptr += 9;
+			offset += 9;
+		}
+		else
+		{
+			elog(ERROR, "Invalid encoding byte: 0x%02X at offset %zu", first_byte, offset);
+			break;
+		}
+		
+		current_key = (i == 0) ? delta : (prev_key + delta);
+		
+		/* Add comma separator for all but first key */
+		if (i > 0)
+			appendStringInfoChar(key_list, ',');
+		
+		appendStringInfo(key_list, "%ld", current_key);
+		
+		prev_key = current_key;
+		
+		/* Progress reporting every 500k keys (at DEBUG1 level) */
+		if (i > 0 && i % 500000 == 0)
+			elog(DEBUG1, "Decoded %lu keys so far", i);
+	}
+	
+	size_mb = key_list->len / (1024.0 * 1024.0);
+	elog(DEBUG1, "Decoded binary keys: %ld keys, %d bytes (%.2f MB)", 
+		 num_keys, key_list->len, size_mb);
+	
+	return key_list;
+}
+
+/*
  * sqliteGetForeignRelSize: Create a FdwPlan for a scan on the foreign table
  */
 static void
@@ -528,6 +1167,15 @@ sqliteGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntable
 
 	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
+	
+	/* Initialize semijoin pushdown fields */
+	fpinfo->is_semijoin_pushdown_safe = false;
+	fpinfo->semijoin_outer_relid = 0;
+	fpinfo->semijoin_join_conds = NIL;
+	fpinfo->semijoin_num_keys = 0;
+	fpinfo->semijoin_keys_binary = NULL;
+	fpinfo->semijoin_keys_binary_size = 0;
+	
 	/* Look up foreign-table catalog info. */
 	fpinfo->table = GetForeignTable(foreigntableid);
 	fpinfo->server = GetForeignServer(fpinfo->table->serverid);
@@ -1122,7 +1770,200 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 
 	elog(DEBUG1, "duckdb_fdw : %s", __func__);
 
-	/* Decide to execute function pushdown support in the target list. */
+	/*
+	 * Detect if this foreign scan is part of a semijoin.
+	 * If the foreign table is on the inner side of a semijoin, we can
+	 * potentially push down the filtering to DuckDB using WHERE IN.
+	 */
+	elog(DEBUG1, "=== SEMIJOIN DETECTION START for relation %d ===", baserel->relid);
+	elog(DEBUG1, "IS_SIMPLE_REL: %d", IS_SIMPLE_REL(baserel));
+	elog(DEBUG1, "join_info_list length: %d", list_length(root->join_info_list));
+	
+	if (IS_SIMPLE_REL(baserel))
+	{
+		ListCell *sjlc;
+		int join_count = 0;
+		
+		foreach(sjlc, root->join_info_list)
+		{
+			SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(sjlc);
+			join_count++;
+			
+			elog(DEBUG1, "Join #%d: type=%d, baserel->relid=%d, in_lefthand=%d, in_righthand=%d", 
+				 join_count, sjinfo->jointype, baserel->relid,
+				 bms_is_member(baserel->relid, sjinfo->syn_lefthand),
+				 bms_is_member(baserel->relid, sjinfo->syn_righthand));
+			
+			/* 
+			 * Check if this is a semijoin involving our foreign table.
+			 * We handle BOTH cases:
+			 * 
+			 * Case 1: Foreign table on LEFT side
+			 *   Query: SELECT * FROM foreign_table WHERE key IN (SELECT key FROM local_table)
+			 *   We collect keys from RIGHT side (local) and push to foreign database
+			 * 
+			 * Case 2: Foreign table on RIGHT side  
+			 *   Query: SELECT * FROM local_table WHERE key IN (SELECT key FROM foreign_table)
+			 *   PostgreSQL will scan the foreign table, we want to push IN clause to limit rows
+			 */
+			if (sjinfo->jointype == JOIN_SEMI)
+			{
+				bool foreign_on_left = bms_is_member(baserel->relid, sjinfo->syn_lefthand);
+				bool foreign_on_right = bms_is_member(baserel->relid, sjinfo->syn_righthand);
+				Index local_relid;
+				char *join_column;
+				
+				if (foreign_on_left)
+				{
+					elog(DEBUG1, "*** SEMIJOIN DETECTED: foreign table %d is on LEFT side ***", baserel->relid);
+					
+					/* Foreign table on left, collect keys from right (local) side */
+					local_relid = bms_next_member(sjinfo->syn_righthand, -1);
+					
+					elog(DEBUG1, "Will collect keys from RIGHT-side (local) table, relid=%d", local_relid);
+				}
+				else if (foreign_on_right)
+				{
+					elog(DEBUG1, "*** SEMIJOIN DETECTED: foreign table %d is on RIGHT side ***", baserel->relid);
+					
+					/* Foreign table on right, collect keys from left (local) side */
+					local_relid = bms_next_member(sjinfo->syn_lefthand, -1);
+					
+					elog(DEBUG1, "Will collect keys from LEFT-side (local) table, relid=%d", local_relid);
+				}
+				else
+				{
+					/* Foreign table not involved in this semijoin */
+					continue;
+				}
+				
+				/*
+				 * Extract the actual join column name from the join expressions
+				 */
+				join_column = extract_join_column_name(root, sjinfo, local_relid, baserel->relid);
+				
+				if (join_column == NULL)
+				{
+					elog(DEBUG1, "Could not extract join column name, skipping optimization");
+					continue;
+				}
+				
+				elog(DEBUG1, "Extracted join column: %s", join_column);
+				
+				/*
+				 * Mark that semijoin pushdown is possible and store information
+				 */
+				fpinfo->is_semijoin_pushdown_safe = true;
+				fpinfo->semijoin_join_conds = sjinfo->semi_rhs_exprs;
+				fpinfo->semijoin_outer_relid = local_relid;
+				
+				elog(DEBUG1, "Semijoin setup: local_relid=%d, join_column=%s, join_conditions=%d",
+					 local_relid, join_column, list_length(fpinfo->semijoin_join_conds));
+				
+			/*
+			 * Collect distinct keys from the local table.
+			 * These keys will be pushed to DuckDB as a WHERE IN clause.
+			 */
+			if (local_relid > 0 && join_column != NULL)
+			{
+				int64 distinct_count;
+				int64 num_keys = 0;
+				const int64 MAX_KEYS_LIMIT = 5000000;  /* Allow up to 5M keys */
+				RelOptInfo *local_rel;
+				List *local_restrictions = NIL;
+				
+				elog(DEBUG1, "Starting key collection from local table (relid=%d, column=%s)...", 
+					 local_relid, join_column);					/*
+					 * Get the local relation's baserestrictinfo to apply WHERE clauses
+					 */
+					local_rel = find_base_rel(root, local_relid);
+					if (local_rel && local_rel->baserestrictinfo != NIL)
+					{
+						local_restrictions = local_rel->baserestrictinfo;
+						elog(DEBUG1, "Found %d restrictions on local table",
+							 list_length(local_restrictions));
+					}
+					
+					
+					/* Count keys first */
+					distinct_count = sqlite_count_distinct_keys_in_local_table(
+						root, local_relid, join_column, local_restrictions);
+					
+					elog(DEBUG1, "Key count result: %ld", distinct_count);
+					
+					if (distinct_count <= 0)
+					{
+						elog(DEBUG1, "No keys to collect, aborting optimization");
+						pfree(join_column);
+					}
+					else if (distinct_count > MAX_KEYS_LIMIT)
+					{
+						elog(DEBUG1, "Semijoin: %ld keys exceeds limit (%ld), using first %ld keys", 
+							 distinct_count, MAX_KEYS_LIMIT, MAX_KEYS_LIMIT);
+						distinct_count = MAX_KEYS_LIMIT;
+					}
+					else if (distinct_count > 100000)
+					{
+						elog(DEBUG1, "Semijoin: skipping optimization, %ld keys exceeds threshold (100K)", distinct_count);
+						elog(DEBUG1, "Reason: IN clause overhead would slow down query");
+						pfree(join_column);
+						distinct_count = 0;  /* Disable optimization */
+					}
+					else
+					{
+						elog(DEBUG1, "Semijoin: %ld keys within limit", distinct_count);
+					}
+					
+					/* Collect the actual key values using binary encoding */
+					if (distinct_count > 0)
+					{
+						StringInfo binary_keys;
+						int64 encoded_size;
+						
+						elog(DEBUG1, "Collecting %ld keys...", distinct_count);
+						
+						/* Collect keys in compressed binary format */
+						binary_keys = sqlite_collect_local_keys_binary(
+							root, local_relid, join_column,
+							&num_keys, distinct_count, &encoded_size, local_restrictions);
+						
+						elog(DEBUG1, "Collection result: binary_keys=%p, num_keys=%ld, encoded_size=%ld",
+							 binary_keys, num_keys, encoded_size);
+						
+						if (binary_keys != NULL && num_keys > 0)
+						{
+							/* Store BINARY data (compressed) - use palloc+memcpy for binary data! */
+							fpinfo->semijoin_keys_binary = (char *) palloc(encoded_size);
+							memcpy(fpinfo->semijoin_keys_binary, binary_keys->data, encoded_size);
+							fpinfo->semijoin_keys_binary_size = encoded_size;
+							fpinfo->semijoin_num_keys = num_keys;
+							
+							/* Store the join column name for later use in BeginForeignScan */
+							fpinfo->semijoin_column_name = pstrdup(join_column);
+							
+							/* Free the StringInfo but keep the data (we copied it) */
+							pfree(binary_keys);
+							
+							elog(DEBUG1, "*** SEMIJOIN: Successfully collected %ld keys (%ld bytes) for column '%s' ***", 
+								 num_keys, encoded_size, join_column);
+						}
+						else
+						{
+							elog(DEBUG1, "Failed to collect keys for semijoin");
+						}
+						
+						/* Free the column name string */
+						pfree(join_column);
+					}
+				}			/*
+			 * For now, we're just marking it. The actual WHERE IN pushdown
+			 * will be implemented in BeginForeignScan where we have access
+			 * to the actual join key values from the outer relation.
+			 */
+			break;
+		}
+	}
+}	/* Decide to execute function pushdown support in the target list. */
 	fpinfo->is_tlist_func_pushdown = sqlite_is_foreign_function_tlist(root, baserel, tlist);
 
 	/*
@@ -1311,6 +2152,24 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 									   has_final_sort, has_limit, false,
 									   &retrieved_attrs, &params_list);
 
+	/*
+	 * SEMIJOIN OPTIMIZATION - DEFER IN CLAUSE TO EXECUTION
+	 * 
+	 * CRITICAL: Building large IN clauses (25+ MB) during PLANNING causes
+	 * PostgreSQL to crash during plan node copying. Solution: Store the
+	 * BINARY KEYS in fdw_private and build the IN clause during EXECUTION.
+	 * 
+	 * This solves the crash by:
+	 * 1. Keeping plan node size small (3.5MB binary vs 25MB text)
+	 * 2. Building large strings in execution context (more memory available)
+	 * 3. Working with 4M+ keys without hitting plan serialization limits
+	 */
+	if (fpinfo->semijoin_keys_binary != NULL && fpinfo->semijoin_num_keys > 0)
+	{
+		/* Binary keys will be stored in fdw_private below for execution-time use */
+	}
+
+
 	/* Remember remote_exprs for possible use by sqlitePlanDirectModify */
 	fpinfo->final_remote_exprs = remote_exprs;
 
@@ -1326,14 +2185,76 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 	/*
 	 * Build the fdw_private list that will be available to the executor.
 	 * Items in the list must match enum FdwScanPrivateIndex, above.
+	 * 
+	 * IMPORTANT: For semijoin optimization with large IN clauses, sql.data
+	 * can be very large (25+ MB). We need to ensure it's properly copied
+	 * to a memory context that survives the planning phase.
 	 */
-	fdw_private = list_make3(makeString(sql.data), retrieved_attrs, makeInteger(for_update));
+	fdw_private = list_make3(makeString(pstrdup(sql.data)), retrieved_attrs, makeInteger(for_update));
 #if (PG_VERSION_NUM < 100000)
 	fdw_private = lappend(fdw_private, makeInteger(root->all_baserels == NULL ? -2 : bms_next_member(root->all_baserels, -1)));
 #endif
+	/*
+	 * Add relation name for joins/upper rels, or NULL for simple scans.
+	 * This ensures consistent list indexing for subsequent elements.
+	 */
 	if (IS_JOIN_REL(baserel) || IS_UPPER_REL(baserel))
 		fdw_private = lappend(fdw_private,
 							  makeString(fpinfo->relation_name));
+	else
+		fdw_private = lappend(fdw_private, makeString(NULL)); /* Placeholder for simple scans */
+
+	/*
+	 * SEMIJOIN OPTIMIZATION - Store binary keys in fdw_private for execution
+	 * 
+	 * If this is a semijoin and we collected keys, store the BINARY compressed
+	 * keys in fdw_private. The executor (sqliteBeginForeignScan) will decode
+	 * them and build the IN clause during execution.
+	 * 
+	 * This avoids PostgreSQL crash from 25MB+ query strings in plan nodes!
+	 */
+	if (fpinfo->is_semijoin_pushdown_safe && 
+		fpinfo->semijoin_keys_binary != NULL && 
+		fpinfo->semijoin_num_keys > 0)
+	{
+		int binary_len;
+		char *hex_output;
+		
+		elog(DEBUG1, "Adding semijoin data to fdw_private: %ld keys, %ld bytes",
+			 fpinfo->semijoin_num_keys, fpinfo->semijoin_keys_binary_size);
+		
+		/*
+		 * Store in fdw_private according to FdwScanPrivateIndex enum.
+		 * Use Hex encoding to store binary data safely as a String.
+		 * This avoids NULL byte truncation and Const node serialization crashes.
+		 */
+		binary_len = fpinfo->semijoin_keys_binary_size;
+		
+		/* Allocate space for Hex string (2 chars per byte + null terminator) */
+		hex_output = (char *) palloc(binary_len * 2 + 1);
+		hex_encode(fpinfo->semijoin_keys_binary, binary_len, hex_output);
+		hex_output[binary_len * 2] = '\0';
+		
+		fdw_private = lappend(fdw_private, makeInteger(1)); /* Semijoin marker */
+		fdw_private = lappend(fdw_private, makeString(fpinfo->semijoin_column_name)); /* Column name */
+		fdw_private = lappend(fdw_private, makeInteger(fpinfo->semijoin_num_keys));
+		fdw_private = lappend(fdw_private, makeInteger(fpinfo->semijoin_keys_binary_size));
+		
+		/* Store binary data as Hex String */
+		fdw_private = lappend(fdw_private, makeString(hex_output));
+		
+		/* Can now free the temporary binary buffer from fpinfo */
+		pfree(fpinfo->semijoin_keys_binary);
+		fpinfo->semijoin_keys_binary = NULL;
+	}
+	else
+	{
+		fdw_private = lappend(fdw_private, makeInteger(0)); /* 0 = no semijoin */
+		fdw_private = lappend(fdw_private, makeString(NULL)); /* Placeholder for column name */
+		fdw_private = lappend(fdw_private, makeInteger(0)); /* Placeholder for num_keys */
+		fdw_private = lappend(fdw_private, makeInteger(0)); /* Placeholder for binary_size */
+		fdw_private = lappend(fdw_private, makeString(NULL)); /* Placeholder for binary_data */
+	}
 
 	/*
 	 * Create the ForeignScan node from target list, local filtering
@@ -1473,6 +2394,110 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->for_update = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateForUpdate)) ? true : false;
 	festate->conn = conn;
 	festate->cursor_exists = false;
+
+	/*
+	 * SEMIJOIN OPTIMIZATION - Build IN clause during EXECUTION
+	 * 
+	 * If the planner detected a semijoin and stored binary keys in fdw_private,
+	 * we decode them here and build the final IN clause query.
+	 * 
+	 * This is safe because:
+	 * 1. We're in execution context (more memory available than planning context)
+	 * 2. The large query string doesn't need to be serialized/copied
+	 * 3. It lives only during query execution
+	 */
+	if (list_length(fsplan->fdw_private) > FdwScanPrivateSemijoinMarker)
+	{
+		int semijoin_marker = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateSemijoinMarker));
+		
+		if (semijoin_marker == 1 && list_length(fsplan->fdw_private) > FdwScanPrivateSemijoinBinaryData)
+		{
+			int64 num_keys;
+			int64 binary_size;
+			char *binary_data;
+			char *column_name;
+			StringInfo binary_wrapper;
+			StringInfo decoded_keys;
+			char *original_query;
+			StringInfo final_query;
+			
+			/* Extract the column name and binary key data from fdw_private */
+			column_name = strVal(list_nth(fsplan->fdw_private, FdwScanPrivateSemijoinColumnName));
+			num_keys = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateSemijoinNumKeys));
+			binary_size = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateSemijoinBinarySize));
+			
+			elog(DEBUG1, "Semijoin: processing IN clause for column '%s' with %ld keys", 
+				 column_name, num_keys);
+
+			/* Extract Hex string and decode */
+			{
+				char *hex_input = strVal(list_nth(fsplan->fdw_private, FdwScanPrivateSemijoinBinaryData));
+				
+				if (hex_input == NULL)
+				{
+					elog(DEBUG1, "Binary data Hex string is NULL");
+					binary_data = NULL;
+				}
+				else
+				{
+					/* Allocate memory for binary data */
+					binary_data = (char *) palloc(binary_size);
+					
+					/* Decode Hex string */
+					hex_decode(hex_input, strlen(hex_input), binary_data);
+					
+					elog(DEBUG1, "Decoded %ld keys from hex string (%ld bytes)", 
+						 num_keys, binary_size);
+				}
+			}
+			
+			if (binary_data != NULL && binary_size > 0)
+			{
+				/* Wrap in StringInfo for the decoder function */
+				binary_wrapper = makeStringInfo();
+				appendBinaryStringInfo(binary_wrapper, binary_data, binary_size);
+				
+				/* Decode the binary keys */
+				decoded_keys = sqlite_decode_binary_keys_to_string(binary_wrapper, num_keys);
+
+				/* Free the wrapper (binary_data is freed with context) */
+				pfree(binary_wrapper->data);
+				pfree(binary_wrapper);
+				
+				if (decoded_keys != NULL && decoded_keys->len > 0)
+				{
+					/* Save the original query */
+					original_query = pstrdup(festate->query);
+					
+					/* Build the final query with IN clause using the actual column name */
+					final_query = makeStringInfo();
+					appendStringInfo(final_query,
+									 "SELECT * FROM (%s) AS subq WHERE %s IN (%s)",
+									 original_query, column_name, decoded_keys->data);
+					
+					/* Replace the query in festate */
+					festate->query = final_query->data;
+					
+					elog(DEBUG1, "Semijoin optimization: IN clause with %ld keys added for column '%s' (query size: %.2f MB)",
+						 num_keys, column_name, final_query->len / (1024.0 * 1024.0));
+					
+					/* Clean up */
+					pfree(decoded_keys->data);
+					pfree(decoded_keys);
+					pfree(original_query);
+				}
+				else
+				{
+					elog(DEBUG1, "Failed to decode binary keys - using original query");
+				}
+			}
+			else
+			{
+				elog(DEBUG1, "No binary data found - using original query");
+			}
+		}
+	}
+
 
 	/*
 	 * Get info we'll need for converting data fetched from the foreign server
@@ -3184,11 +4209,11 @@ sqlite_foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype
 	List *joinclauses;
 
 	/*
-	 * We support pushing down INNER and LEFT joins. Constructing queries
-	 * representing SEMI and ANTI joins is hard, hence not considered right
-	 * now.
+	 * We support pushing down INNER, LEFT, and SEMI joins.
+	 * SEMI joins are particularly important for performance when both
+	 * tables are foreign - they can be translated to EXISTS or IN queries.
 	 */
-	if (jointype != JOIN_INNER && jointype != JOIN_LEFT)
+	if (jointype != JOIN_INNER && jointype != JOIN_LEFT && jointype != JOIN_SEMI)
 		return false;
 
 	/*
@@ -3340,6 +4365,17 @@ sqlite_foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype
 										   fpinfo_o->remote_conds);
 		break;
 
+	case JOIN_SEMI:
+		/* 
+		 * SEMI joins are treated like INNER joins for condition handling.
+		 * All conditions from both sides can be pushed down.
+		 */
+		fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+										   fpinfo_i->remote_conds);
+		fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+										   fpinfo_o->remote_conds);
+		break;
+
 	default:
 		/* Should not happen, we have just checked this above */
 		elog(ERROR, "unsupported join type %d", jointype);
@@ -3349,12 +4385,59 @@ sqlite_foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype
 	 * For an inner join, all restrictions can be treated alike. Treating the
 	 * pushed down conditions as join conditions allows a top level full outer
 	 * join to be deparsed without requiring subqueries.
+	 * 
+	 * For SEMI joins with both foreign tables, we need to be smarter:
+	 * Keep single-table filters in remote_conds (WHERE clause) for early filtering,
+	 * and only move join conditions to joinclauses (ON clause).
 	 */
 	if (jointype == JOIN_INNER)
 	{
 		Assert(!fpinfo->joinclauses);
 		fpinfo->joinclauses = fpinfo->remote_conds;
 		fpinfo->remote_conds = NIL;
+	}
+	else if (jointype == JOIN_SEMI)
+	{
+		/*
+		 * For SEMI JOIN, separate conditions that reference only the outer table
+		 * (should go in WHERE) from actual join conditions (should go in ON).
+		 * This is critical for performance when both tables are foreign.
+		 */
+		ListCell *lc_semi;
+		List *join_conds = NIL;
+		List *where_conds = NIL;
+		Relids outer_relids = outerrel->relids;
+		Relids inner_relids = innerrel->relids;
+		
+	foreach(lc_semi, fpinfo->remote_conds)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc_semi);
+		Relids clause_relids = pull_varnos(root, (Node *) rinfo->clause);
+		/*
+		 * For SEMI JOIN, inner table columns are not accessible after the join.
+		 * - Conditions on outer table only → WHERE clause (can filter before join)
+		 * - Conditions on inner table only → ON clause (must be evaluated during join)
+		 * - Conditions on both tables → ON clause (join conditions)
+		 */
+		if (bms_is_subset(clause_relids, outer_relids))
+		{
+			/* References only outer table - keep in WHERE for early filtering */
+			where_conds = lappend(where_conds, rinfo);
+		}
+		else if (bms_is_subset(clause_relids, inner_relids))
+		{
+			/* References only inner table - MUST go in ON clause (r2 not visible in WHERE) */
+			join_conds = lappend(join_conds, rinfo);
+		}
+		else
+		{
+			/* References both tables - goes in ON clause */
+			join_conds = lappend(join_conds, rinfo);
+		}
+	}
+		
+		fpinfo->joinclauses = join_conds;
+		fpinfo->remote_conds = where_conds;
 	}
 
 	/* Mark that this join can be pushed down safely */
@@ -3534,6 +4617,14 @@ sqliteGetForeignJoinPaths(PlannerInfo *root,
 	joinrel->fdw_private = fpinfo;
 	/* attrs_used is only for base relations. */
 	fpinfo->attrs_used = NULL;
+	
+	/* Initialize semijoin pushdown fields */
+	fpinfo->is_semijoin_pushdown_safe = false;
+	fpinfo->semijoin_outer_relid = 0;
+	fpinfo->semijoin_join_conds = NIL;
+	fpinfo->semijoin_num_keys = 0;
+	fpinfo->semijoin_keys_binary = NULL;
+	fpinfo->semijoin_keys_binary_size = 0;
 
 	/*
 	 * If there is a possibility that EvalPlanQual will be executed, we need
@@ -3960,6 +5051,14 @@ sqliteGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	fpinfo->pushdown_safe = false;
 	fpinfo->stage = stage;
 	output_rel->fdw_private = fpinfo;
+	
+	/* Initialize semijoin pushdown fields */
+	fpinfo->is_semijoin_pushdown_safe = false;
+	fpinfo->semijoin_outer_relid = 0;
+	fpinfo->semijoin_join_conds = NIL;
+	fpinfo->semijoin_num_keys = 0;
+	fpinfo->semijoin_keys_binary = NULL;
+	fpinfo->semijoin_keys_binary_size = 0;
 
 	switch (stage)
 	{
