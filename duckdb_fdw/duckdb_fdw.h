@@ -253,6 +253,15 @@ typedef struct SqliteFdwRelationInfo
 	int64		semijoin_num_keys;			/* Number of keys collected */
 	char	   *semijoin_keys_binary;		/* Binary-compressed key data (delta+varint encoding) */
 	int64		semijoin_keys_binary_size;	/* Size of binary data in bytes */
+	
+	/* Inner join pushdown support (mixed local/foreign) */
+	bool		is_inner_join_pushdown_safe;	/* Can we optimize this mixed join? */
+	int			inner_join_local_relid;			/* Relid of the local table */
+	int			inner_join_foreign_relid;		/* Relid of the foreign table */
+	char	   *inner_join_column_name;			/* Name of the join column */
+	int64		inner_join_num_keys;			/* Number of keys collected from local table */
+	char	   *inner_join_keys_binary;			/* Binary-compressed key data */
+	int64		inner_join_keys_binary_size;	/* Size of binary data in bytes */
 }			SqliteFdwRelationInfo;
 
 /*

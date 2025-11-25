@@ -149,7 +149,25 @@ enum FdwScanPrivateIndex
 	FdwScanPrivateSemijoinBinarySize,
 	
 	/* String: Binary encoded keys data (as bytea) */
-	FdwScanPrivateSemijoinBinaryData
+	FdwScanPrivateSemijoinBinaryData,
+	
+	/*
+	 * Integer indicating if this scan is part of an INNER JOIN optimization (1) or not (0).
+	 * Added to enable INNER JOIN pushdown optimizations for mixed local/foreign tables.
+	 */
+	FdwScanPrivateInnerJoinMarker,
+	
+	/* String: Name of the join column for INNER JOIN optimization */
+	FdwScanPrivateInnerJoinColumnName,
+	
+	/* Integer: Number of keys in INNER JOIN optimization */
+	FdwScanPrivateInnerJoinNumKeys,
+	
+	/* Integer: Size of binary encoded keys data for INNER JOIN */
+	FdwScanPrivateInnerJoinBinarySize,
+	
+	/* String: Binary encoded keys data for INNER JOIN (as bytea) */
+	FdwScanPrivateInnerJoinBinaryData
 };
 
 /*
@@ -1000,8 +1018,8 @@ sqlite_collect_local_keys_binary(PlannerInfo *root, Index outer_relid, const cha
 		
 		prev_key = current_key;
 		
-		/* Progress reporting every 500k keys (at DEBUG1 level) */
-		if (i > 0 && i % 500000 == 0)
+		/* Progress reporting every 50000 keys (at DEBUG1 level) */
+		if (i > 0 && i % 50000 == 0)
 			elog(DEBUG1, "Encoded %lu keys so far (%d bytes)", i, binary_data->len);
 	}
 	
@@ -1175,6 +1193,15 @@ sqliteGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntable
 	fpinfo->semijoin_num_keys = 0;
 	fpinfo->semijoin_keys_binary = NULL;
 	fpinfo->semijoin_keys_binary_size = 0;
+	
+	/* Initialize inner join pushdown fields */
+	fpinfo->is_inner_join_pushdown_safe = false;
+	fpinfo->inner_join_local_relid = 0;
+	fpinfo->inner_join_foreign_relid = 0;
+	fpinfo->inner_join_column_name = NULL;
+	fpinfo->inner_join_num_keys = 0;
+	fpinfo->inner_join_keys_binary = NULL;
+	fpinfo->inner_join_keys_binary_size = 0;
 	
 	/* Look up foreign-table catalog info. */
 	fpinfo->table = GetForeignTable(foreigntableid);
@@ -1963,7 +1990,278 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			break;
 		}
 	}
-}	/* Decide to execute function pushdown support in the target list. */
+}
+	/*
+	 * INNER JOIN Optimization: Check root->parse->jointree for join conditions with local tables.
+	 * 
+	 * IMPORTANT: PostgreSQL's join_info_list, baserel->joininfo, and scan_clauses are ALL EMPTY 
+	 * for INNER joins at GetForeignPlan time. Join clauses haven't been flattened into scan_clauses yet.
+	 * 
+	 * NEW Strategy:
+	 * Instead of looking for join clauses in processed structures, look at the raw query tree
+	 * in root->parse->jointree->fromlist, or examine equivalence classes in root->eq_classes.
+	 * 
+	 * For now, let's try using equivalence classes which track equality relationships between columns.
+	 */
+	{
+		ListCell *lc_ec;
+		const int64 MAX_KEYS_LIMIT = 5000000;  /* Allow up to 5M keys */
+		bool optimization_applied = false;
+
+		elog(NOTICE, "=== INNER JOIN OPTIMIZATION: Starting check for baserel %d ===", baserel->relid);
+		elog(NOTICE, "scan_clauses length: %d (was empty - join clauses not there yet)", list_length(scan_clauses));
+		elog(NOTICE, "eq_classes length: %d", list_length(root->eq_classes));
+		elog(NOTICE, "simple_rel_array_size: %d", root->simple_rel_array_size);
+		
+		/*
+		 * Iterate through equivalence classes to find equality relationships between
+		 * our foreign table and local tables with filters.
+		 */
+		foreach(lc_ec, root->eq_classes)
+		{
+			EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc_ec);
+			ListCell *lc_em1, *lc_em2;
+			EquivalenceMember *em_foreign = NULL;
+			EquivalenceMember *em_local = NULL;
+			int local_relid = -1;
+			RelOptInfo *local_rel = NULL;
+			
+			elog(NOTICE, "Examining equivalence class with %d members...", list_length(ec->ec_members));
+			
+			/*
+			 * Check if this equivalence class contains our foreign baserel.
+			 * If so, check if it also contains a local table with filters.
+			 */
+			bool has_foreign = false;
+			foreach(lc_em1, ec->ec_members)
+			{
+				EquivalenceMember *em = (EquivalenceMember *) lfirst(lc_em1);
+				
+				if (bms_is_member(baserel->relid, em->em_relids))
+				{
+					has_foreign = true;
+					em_foreign = em;
+					elog(NOTICE, "  EC contains our foreign relation %d", baserel->relid);
+					break;
+				}
+			}
+			
+			if (!has_foreign)
+			{
+				elog(NOTICE, "  EC does not contain our foreign relation, skipping");
+				continue;
+			}
+			
+			/*
+			 * Now check if this EC also contains a local table with filters.
+			 */
+			foreach(lc_em2, ec->ec_members)
+			{
+				EquivalenceMember *em = (EquivalenceMember *) lfirst(lc_em2);
+				int other_relid;
+				RelOptInfo *other_rel;
+				bool other_is_foreign;
+				
+				/* Skip the foreign relation itself */
+				if (bms_is_member(baserel->relid, em->em_relids))
+					continue;
+				
+				/* Get the relation ID from em_relids */
+				if (bms_num_members(em->em_relids) != 1)
+					continue;  /* Skip multi-relation members */
+				
+				other_relid = bms_singleton_member(em->em_relids);
+				
+				elog(NOTICE, "    Checking EC member for relation %d...", other_relid);
+				
+				if (other_relid >= root->simple_rel_array_size)
+					continue;
+				
+				other_rel = root->simple_rel_array[other_relid];
+				if (!other_rel || other_rel->reloptkind != RELOPT_BASEREL)
+					continue;
+				
+				/* Check if local (not foreign) */
+				other_is_foreign = false;
+				if (other_rel->fdw_private)
+				{
+					SqliteFdwRelationInfo *other_fpinfo = (SqliteFdwRelationInfo *) other_rel->fdw_private;
+					other_is_foreign = other_fpinfo->pushdown_safe;
+				}
+				
+				if (other_is_foreign)
+				{
+					elog(NOTICE, "      Relation %d is foreign, skipping", other_relid);
+					continue;
+				}
+				
+				/* Check if has filters */
+				if (other_rel->baserestrictinfo == NIL)
+				{
+					elog(NOTICE, "      Relation %d is local but has no filters, skipping", other_relid);
+					continue;
+				}
+				
+				elog(NOTICE, "      FOUND! Relation %d is local with %d filter(s)",
+					 other_relid, list_length(other_rel->baserestrictinfo));
+				
+				em_local = em;
+				local_relid = other_relid;
+				local_rel = other_rel;
+				break;  /* Found a suitable local relation in this EC */
+			}
+			
+			if (!em_local || local_relid < 0 || !local_rel)
+			{
+				elog(NOTICE, "  No suitable local relation found in this EC");
+				continue;
+			}
+			
+			/*
+			 * Extract column names from the equivalence members.
+			 * em_expr should be a Var node for simple column references.
+			 */
+			char *local_join_column = NULL;
+			char *foreign_join_column = NULL;
+			
+			if (IsA(em_local->em_expr, Var))
+			{
+				Var *local_var = (Var *) em_local->em_expr;
+				RangeTblEntry *local_rte = planner_rt_fetch(local_relid, root);
+				local_join_column = get_attname(local_rte->relid, local_var->varattno, false);
+				if (local_join_column)
+				{
+					local_join_column = pstrdup(local_join_column);
+					elog(NOTICE, "  Extracted local column: '%s'", local_join_column);
+				}
+			}
+			
+			if (IsA(em_foreign->em_expr, Var))
+			{
+				Var *foreign_var = (Var *) em_foreign->em_expr;
+				RangeTblEntry *foreign_rte = planner_rt_fetch(baserel->relid, root);
+				foreign_join_column = get_attname(foreign_rte->relid, foreign_var->varattno, false);
+				if (foreign_join_column)
+				{
+					foreign_join_column = pstrdup(foreign_join_column);
+					elog(NOTICE, "  Extracted foreign column: '%s'", foreign_join_column);
+				}
+			}
+			
+			if (!local_join_column || !foreign_join_column)
+			{
+				elog(NOTICE, "  Could not extract column names, skipping");
+				if (local_join_column) pfree(local_join_column);
+				if (foreign_join_column) pfree(foreign_join_column);
+				continue;
+			}
+			
+			/*
+			 * We found a local table with filters that joins with our foreign table!
+			 * Now collect the filtered keys.
+			 */
+			elog(NOTICE, "=== OPTIMIZATION OPPORTUNITY DETECTED ===");
+			elog(NOTICE, "Local table (filtered): relation %d, column '%s'", local_relid, local_join_column);
+			elog(NOTICE, "Foreign table: relation %d (this scan), column '%s'", baserel->relid, foreign_join_column);
+			
+			elog(NOTICE, "Counting distinct keys in local table %d on column '%s'...",
+				 local_relid, local_join_column);
+			
+			int64 distinct_count = sqlite_count_distinct_keys_in_local_table(
+				root, local_relid, local_join_column, local_rel->baserestrictinfo);
+			
+			elog(NOTICE, "Distinct key count result: %ld", distinct_count);
+			
+			if (distinct_count <= 0)
+			{
+				elog(NOTICE, "Skipping: no keys to collect (count=%ld)", distinct_count);
+				pfree(local_join_column);
+				pfree(foreign_join_column);
+				continue;
+			}
+			
+			elog(NOTICE, "Found %ld distinct keys to push down", distinct_count);
+			
+			if (distinct_count > 100000)
+			{
+				elog(NOTICE, "Skipping: too many keys (%ld exceeds 100K threshold)", distinct_count);
+				pfree(local_join_column);
+				pfree(foreign_join_column);
+				continue;
+			}
+			
+			int64 max_keys = distinct_count;
+			if (max_keys > MAX_KEYS_LIMIT)
+			{
+				elog(NOTICE, "Limiting keys from %ld to %ld (MAX_KEYS_LIMIT)",
+					 distinct_count, MAX_KEYS_LIMIT);
+				max_keys = MAX_KEYS_LIMIT;
+			}
+			
+			elog(NOTICE, "Collecting %ld keys from local table...", max_keys);
+			
+			StringInfo binary_keys = NULL;
+			int64 num_keys = 0;
+			int64 encoded_size = 0;
+			
+			binary_keys = sqlite_collect_local_keys_binary(
+				root, local_relid, local_join_column,
+				&num_keys, max_keys, &encoded_size, local_rel->baserestrictinfo);
+			
+			elog(NOTICE, "Collection result: binary_keys=%s, num_keys=%ld, encoded_size=%ld",
+				 binary_keys ? "NOT NULL" : "NULL", num_keys, encoded_size);
+			
+			if (!binary_keys || num_keys <= 0 || encoded_size <= 0)
+			{
+				elog(NOTICE, "Skipping: key collection failed");
+				pfree(local_join_column);
+				pfree(foreign_join_column);
+				if (binary_keys)
+					pfree(binary_keys->data);
+				continue;
+			}
+			
+			/*
+			 * Success! Store the information for later use in BeginForeignScan.
+			 * Use the FOREIGN table's column name for the WHERE IN clause.
+			 */
+			elog(NOTICE, "SUCCESS! Storing INNER JOIN optimization data in fpinfo");
+			
+			fpinfo->is_inner_join_pushdown_safe = true;
+			fpinfo->inner_join_local_relid = local_relid;
+			fpinfo->inner_join_foreign_relid = baserel->relid;
+			fpinfo->inner_join_column_name = foreign_join_column;  /* Use foreign column name */
+			fpinfo->inner_join_num_keys = num_keys;
+			fpinfo->inner_join_keys_binary = (char *) palloc(encoded_size);
+			memcpy(fpinfo->inner_join_keys_binary, binary_keys->data, encoded_size);
+			fpinfo->inner_join_keys_binary_size = encoded_size;
+			
+			elog(NOTICE, "=== INNER JOIN OPTIMIZATION ENABLED ===");
+			elog(NOTICE, "Will push %ld filtered keys from local table %d to foreign table %d",
+				 (long) num_keys, local_relid, baserel->relid);
+			elog(NOTICE, "Join columns: local='%s', foreign='%s'", local_join_column, foreign_join_column);
+			elog(NOTICE, "Binary size: %ld bytes", encoded_size);
+			elog(NOTICE, "=======================================");
+			
+			pfree(local_join_column);
+			/* Don't free foreign_join_column - it's stored in fpinfo */
+			
+			optimization_applied = true;
+			
+			/*
+			 * We only handle one optimized join per foreign scan.
+			 * If there are multiple joins, we optimize the first one found.
+			 */
+			break;
+		}
+		
+		if (!optimization_applied)
+		{
+			elog(NOTICE, "=== INNER JOIN OPTIMIZATION: No applicable join found ===");
+		}
+	}
+
+	/* Decide to execute function pushdown support in the target list. */
 	fpinfo->is_tlist_func_pushdown = sqlite_is_foreign_function_tlist(root, baserel, tlist);
 
 	/*
@@ -2257,6 +2555,69 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 	}
 
 	/*
+	 * INNER JOIN OPTIMIZATION - Store binary keys in fdw_private for execution
+	 * 
+	 * Similar to semijoin optimization, if this is an optimizable INNER JOIN
+	 * with a local table filtered and a foreign table, we store the filtered
+	 * keys from the local side to push down to the foreign side at execution time.
+	 */
+	elog(NOTICE, "Checking if INNER JOIN optimization data needs to be packed...");
+	elog(NOTICE, "is_inner_join_pushdown_safe=%s, keys_binary=%s, num_keys=%ld",
+		 fpinfo->is_inner_join_pushdown_safe ? "TRUE" : "FALSE",
+		 fpinfo->inner_join_keys_binary ? "NOT NULL" : "NULL",
+		 fpinfo->inner_join_num_keys);
+		 
+	if (fpinfo->is_inner_join_pushdown_safe && 
+		fpinfo->inner_join_keys_binary != NULL && 
+		fpinfo->inner_join_num_keys > 0)
+	{
+		int binary_len;
+		char *hex_output;
+		
+		elog(NOTICE, "=== PACKING INNER JOIN DATA INTO fdw_private ===");
+		elog(NOTICE, "Keys: %ld, Binary size: %ld bytes, Column: '%s'",
+			 fpinfo->inner_join_num_keys, 
+			 fpinfo->inner_join_keys_binary_size,
+			 fpinfo->inner_join_column_name);
+		
+		/*
+		 * Store in fdw_private according to FdwScanPrivateIndex enum.
+		 * Use Hex encoding to store binary data safely as a String.
+		 */
+		binary_len = fpinfo->inner_join_keys_binary_size;
+		
+		/* Allocate space for Hex string (2 chars per byte + null terminator) */
+		hex_output = (char *) palloc(binary_len * 2 + 1);
+		hex_encode(fpinfo->inner_join_keys_binary, binary_len, hex_output);
+		hex_output[binary_len * 2] = '\0';
+		
+		fdw_private = lappend(fdw_private, makeInteger(1)); /* Inner join marker */
+		fdw_private = lappend(fdw_private, makeString(fpinfo->inner_join_column_name)); /* Column name */
+		fdw_private = lappend(fdw_private, makeInteger(fpinfo->inner_join_num_keys));
+		fdw_private = lappend(fdw_private, makeInteger(fpinfo->inner_join_keys_binary_size));
+		
+		/* Store binary data as Hex String */
+		fdw_private = lappend(fdw_private, makeString(hex_output));
+		
+		elog(NOTICE, "Hex encoded data length: %d characters", (int)strlen(hex_output));
+		elog(NOTICE, "fdw_private now has %d elements", list_length(fdw_private));
+		elog(NOTICE, "===============================================");
+		
+		/* Can now free the temporary binary buffer from fpinfo */
+		pfree(fpinfo->inner_join_keys_binary);
+		fpinfo->inner_join_keys_binary = NULL;
+	}
+	else
+	{
+		elog(NOTICE, "No INNER JOIN optimization - adding placeholders to fdw_private");
+		fdw_private = lappend(fdw_private, makeInteger(0)); /* 0 = no inner join optimization */
+		fdw_private = lappend(fdw_private, makeString(NULL)); /* Placeholder for column name */
+		fdw_private = lappend(fdw_private, makeInteger(0)); /* Placeholder for num_keys */
+		fdw_private = lappend(fdw_private, makeInteger(0)); /* Placeholder for binary_size */
+		fdw_private = lappend(fdw_private, makeString(NULL)); /* Placeholder for binary_data */
+	}
+
+	/*
 	 * Create the ForeignScan node from target list, local filtering
 	 * expressions, remote parameter expressions, and FDW private information.
 	 *
@@ -2493,11 +2854,136 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 			}
 			else
 			{
-				elog(DEBUG1, "No binary data found - using original query");
-			}
+			elog(DEBUG1, "No binary data found - using original query");
 		}
 	}
+}
 
+
+	/*
+	 * INNER JOIN OPTIMIZATION - Build IN clause during EXECUTION
+	 * 
+	 * Similar to semijoin optimization, if the planner detected an optimizable
+	 * INNER JOIN with a filtered local table joined to a foreign table, we decode
+	 * the filtered keys here and build the final IN clause query.
+	 */
+	elog(NOTICE, "=== CHECKING FOR INNER JOIN OPTIMIZATION DATA ===");
+	elog(NOTICE, "fdw_private length: %d, FdwScanPrivateInnerJoinMarker=%d", 
+		 list_length(fsplan->fdw_private), FdwScanPrivateInnerJoinMarker);
+		 
+	if (list_length(fsplan->fdw_private) > FdwScanPrivateInnerJoinMarker)
+	{
+		int inner_join_marker = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinMarker));
+		
+		elog(NOTICE, "Inner join marker value: %d (1=enabled, 0=disabled)", inner_join_marker);
+		
+		if (inner_join_marker == 1 && list_length(fsplan->fdw_private) > FdwScanPrivateInnerJoinBinaryData)
+		{
+			int64 num_keys;
+			int64 binary_size;
+			char *binary_data;
+			char *column_name;
+			StringInfo binary_wrapper;
+			StringInfo decoded_keys;
+			char *original_query;
+			StringInfo final_query;
+			
+			elog(NOTICE, "=== INNER JOIN OPTIMIZATION: DECODING KEYS ===");
+			
+			/* Extract the column name and binary key data from fdw_private */
+			column_name = strVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinColumnName));
+			num_keys = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinNumKeys));
+			binary_size = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinBinarySize));
+			
+			elog(NOTICE, "Column: '%s', Num keys: %ld, Binary size: %ld", 
+				 column_name, num_keys, binary_size);
+
+			/* Extract Hex string and decode */
+			{
+				char *hex_input = strVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinBinaryData));
+				
+				if (hex_input == NULL)
+				{
+					elog(NOTICE, "ERROR: Hex string is NULL!");
+					binary_data = NULL;
+				}
+				else
+				{
+					elog(NOTICE, "Hex string length: %d characters", (int)strlen(hex_input));
+					
+					/* Allocate memory for binary data */
+					binary_data = (char *) palloc(binary_size);
+					
+					/* Decode Hex string */
+					hex_decode(hex_input, strlen(hex_input), binary_data);
+					
+					elog(NOTICE, "Successfully decoded %ld keys from hex (%ld bytes)", 
+						 num_keys, binary_size);
+				}
+			}
+			
+			if (binary_data != NULL && binary_size > 0)
+			{
+				elog(NOTICE, "Decoding binary keys to string...");
+				
+				/* Wrap in StringInfo for the decoder function */
+				binary_wrapper = makeStringInfo();
+				appendBinaryStringInfo(binary_wrapper, binary_data, binary_size);
+				
+				/* Decode the binary keys */
+				decoded_keys = sqlite_decode_binary_keys_to_string(binary_wrapper, num_keys);
+
+				/* Free the wrapper (binary_data is freed with context) */
+				pfree(binary_wrapper->data);
+				pfree(binary_wrapper);
+				
+				if (decoded_keys != NULL && decoded_keys->len > 0)
+				{
+					elog(NOTICE, "Decoded keys string length: %d characters", decoded_keys->len);
+					
+					/* Save the original query */
+					original_query = pstrdup(festate->query);
+					
+					elog(NOTICE, "Original query length: %d characters", (int)strlen(original_query));
+					
+					/* Build the final query with IN clause using the actual column name */
+					final_query = makeStringInfo();
+					appendStringInfo(final_query,
+									 "SELECT * FROM (%s) AS subq WHERE %s IN (%s)",
+									 original_query, column_name, decoded_keys->data);
+					
+					/* Replace the query in festate */
+					festate->query = final_query->data;
+					
+					elog(NOTICE, "=== INNER JOIN OPTIMIZATION APPLIED ===");
+					elog(NOTICE, "Added WHERE %s IN (...) with %ld keys", column_name, num_keys);
+					elog(NOTICE, "Final query size: %.2f MB", final_query->len / (1024.0 * 1024.0));
+					elog(NOTICE, "=======================================");
+					
+					/* Clean up */
+					pfree(decoded_keys->data);
+					pfree(decoded_keys);
+					pfree(original_query);
+				}
+				else
+				{
+					elog(NOTICE, "ERROR: Failed to decode binary keys - using original query");
+				}
+			}
+			else
+			{
+				elog(NOTICE, "ERROR: No binary data found - using original query");
+			}
+		}
+		else
+		{
+			elog(NOTICE, "Inner join marker is 0 or insufficient fdw_private elements");
+		}
+	}
+	else
+	{
+		elog(NOTICE, "fdw_private too short - no INNER JOIN optimization data");
+	}
 
 	/*
 	 * Get info we'll need for converting data fetched from the foreign server
@@ -4377,7 +4863,7 @@ sqlite_foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype
 		break;
 
 	default:
-		/* Should not happen, we have just checked this above */
+		/* Should not happen*/
 		elog(ERROR, "unsupported join type %d", jointype);
 	}
 
@@ -4625,6 +5111,15 @@ sqliteGetForeignJoinPaths(PlannerInfo *root,
 	fpinfo->semijoin_num_keys = 0;
 	fpinfo->semijoin_keys_binary = NULL;
 	fpinfo->semijoin_keys_binary_size = 0;
+	
+	/* Initialize inner join pushdown fields */
+	fpinfo->is_inner_join_pushdown_safe = false;
+	fpinfo->inner_join_local_relid = 0;
+	fpinfo->inner_join_foreign_relid = 0;
+	fpinfo->inner_join_column_name = NULL;
+	fpinfo->inner_join_num_keys = 0;
+	fpinfo->inner_join_keys_binary = NULL;
+	fpinfo->inner_join_keys_binary_size = 0;
 
 	/*
 	 * If there is a possibility that EvalPlanQual will be executed, we need
@@ -5059,6 +5554,15 @@ sqliteGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	fpinfo->semijoin_num_keys = 0;
 	fpinfo->semijoin_keys_binary = NULL;
 	fpinfo->semijoin_keys_binary_size = 0;
+	
+	/* Initialize inner join pushdown fields */
+	fpinfo->is_inner_join_pushdown_safe = false;
+	fpinfo->inner_join_local_relid = 0;
+	fpinfo->inner_join_foreign_relid = 0;
+	fpinfo->inner_join_column_name = NULL;
+	fpinfo->inner_join_num_keys = 0;
+	fpinfo->inner_join_keys_binary = NULL;
+	fpinfo->inner_join_keys_binary_size = 0;
 
 	switch (stage)
 	{
