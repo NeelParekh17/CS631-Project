@@ -566,13 +566,18 @@ static char *
 extract_join_column_name(PlannerInfo *root, SpecialJoinInfo *sjinfo, 
 						 Index local_relid, Index foreign_relid)
 {
-	ListCell *lc;
+	ListCell *lc, *lc2;
 	RangeTblEntry *local_rte;
 	char *colname;
+	RelOptInfo *local_rel, *foreign_rel;
 	
-	/* First try semi_rhs_exprs */
+	elog(DEBUG1, "extract_join_column_name: local_relid=%d, foreign_relid=%d", local_relid, foreign_relid);
+	elog(DEBUG1, "semi_rhs_exprs: %s", sjinfo->semi_rhs_exprs == NIL ? "NIL" : "NOT NIL");
+	
+	/* First try semi_rhs_exprs (for semijoins) */
 	if (sjinfo->semi_rhs_exprs != NIL)
 	{
+		elog(DEBUG1, "Checking semi_rhs_exprs (%d entries)...", list_length(sjinfo->semi_rhs_exprs));
 		foreach(lc, sjinfo->semi_rhs_exprs)
 		{
 			Expr *expr = (Expr *) lfirst(lc);
@@ -595,16 +600,73 @@ extract_join_column_name(PlannerInfo *root, SpecialJoinInfo *sjinfo,
 		}
 	}
 	
-	/* If that didn't work, look at the min_lefthand and min_righthand equivalence classes */
-	/* Search through root->eq_classes for equivalences involving both tables */
+	/* For outer joins, try looking at join quals on the foreign relation */
+	if (foreign_relid < root->simple_rel_array_size)
+	{
+		foreign_rel = root->simple_rel_array[foreign_relid];
+		if (foreign_rel && foreign_rel->joininfo)
+		{
+			elog(DEBUG1, "Checking joininfo list for foreign_relid=%d (%d entries)...", 
+				 foreign_relid, list_length(foreign_rel->joininfo));
+			foreach(lc, foreign_rel->joininfo)
+			{
+				RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+				
+				/* Look for equality conditions (OpExpr with = operator) */
+				if (IsA(rinfo->clause, OpExpr))
+				{
+					OpExpr *opexpr = (OpExpr *) rinfo->clause;
+					Var *left_var = NULL;
+					Var *right_var = NULL;
+					
+					/* Check if it's a binary operator with two Var arguments */
+					if (list_length(opexpr->args) == 2)
+					{
+						Node *left_arg = (Node *) linitial(opexpr->args);
+						Node *right_arg = (Node *) lsecond(opexpr->args);
+						
+						if (IsA(left_arg, Var))
+							left_var = (Var *) left_arg;
+						if (IsA(right_arg, Var))
+							right_var = (Var *) right_arg;
+						
+						/* Check if one is local and one is foreign */
+						if (left_var && right_var)
+						{
+							elog(DEBUG1, "  Found join condition: varno %d = varno %d", 
+								 left_var->varno, right_var->varno);
+							
+							if ((left_var->varno == local_relid && right_var->varno == foreign_relid) ||
+								(left_var->varno == foreign_relid && right_var->varno == local_relid))
+							{
+								/* Extract column name from local table */
+								Var *local_var_to_use = (left_var->varno == local_relid) ? left_var : right_var;
+								local_rte = planner_rt_fetch(local_relid, root);
+								colname = get_attname(local_rte->relid, local_var_to_use->varattno, false);
+								if (colname)
+								{
+									elog(DEBUG1, "Extracted join column from joininfo: %s", colname);
+									return pstrdup(colname);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	/* Try equivalence classes (for inner joins) */
+	elog(DEBUG1, "Checking equivalence classes (%d total)...", list_length(root->eq_classes));
 	if (root->eq_classes != NIL)
 	{
 		foreach(lc, root->eq_classes)
 		{
 			EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc);
-			ListCell *lc2;
 			Var *local_var = NULL;
 			Var *foreign_var = NULL;
+			
+			elog(DEBUG1, "  Checking EC with %d members...", list_length(ec->ec_members));
 			
 			/* Look for members from both local and foreign tables */
 			foreach(lc2, ec->ec_members)
@@ -615,10 +677,18 @@ extract_join_column_name(PlannerInfo *root, SpecialJoinInfo *sjinfo,
 				{
 					Var *var = (Var *) em->em_expr;
 					
+					elog(DEBUG1, "    EC member: Var with varno=%d", var->varno);
+					
 					if (var->varno == local_relid)
+					{
 						local_var = var;
+						elog(DEBUG1, "      Found local_var (varno=%d, varattno=%d)", var->varno, var->varattno);
+					}
 					else if (var->varno == foreign_relid)
+					{
 						foreign_var = var;
+						elog(DEBUG1, "      Found foreign_var (varno=%d, varattno=%d)", var->varno, var->varattno);
+					}
 				}
 			}
 			
@@ -1989,6 +2059,205 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			 */
 			break;
 		}
+		
+		/*
+		 * OUTER JOIN Optimization (LEFT/RIGHT/FULL OUTER):
+		 * Handle cases where we have a filtered local table joining with a foreign table.
+		 * 
+		 * LEFT JOIN:  local_filtered LEFT JOIN foreign  => push keys from local to foreign
+		 * RIGHT JOIN: foreign RIGHT JOIN local_filtered => push keys from local to foreign
+		 * FULL JOIN:  local_filtered FULL JOIN foreign  => push keys from local to foreign
+		 * 
+		 * The key insight: When the filtered side is local, we can push those keys to
+		 * the foreign side to reduce data transfer.
+		 */
+		if (sjinfo->jointype == JOIN_LEFT || sjinfo->jointype == JOIN_RIGHT || sjinfo->jointype == JOIN_FULL)
+		{
+			bool foreign_on_left = bms_is_member(baserel->relid, sjinfo->syn_lefthand);
+			bool foreign_on_right = bms_is_member(baserel->relid, sjinfo->syn_righthand);
+			Index local_relid = 0;
+			RelOptInfo *local_rel = NULL;
+			char *join_column = NULL;
+			bool should_optimize = false;
+			
+			elog(DEBUG1, "*** OUTER JOIN DETECTED: type=%d, foreign_relid=%d ***",
+				 sjinfo->jointype, baserel->relid);
+			elog(DEBUG1, "foreign_on_left=%d, foreign_on_right=%d", foreign_on_left, foreign_on_right);
+			
+			/*
+			 * Determine if we should optimize based on join type and which side has the foreign table:
+			 * 
+			 * LEFT JOIN (local LEFT JOIN foreign):  local on left, foreign on right
+			 *   - Can optimize if LOCAL (left) side has filters
+			 * 
+			 * RIGHT JOIN (foreign RIGHT JOIN local): local on right, foreign on left  
+			 *   - Can optimize if LOCAL (right) side has filters
+			 * 
+			 * FULL JOIN: Can optimize if EITHER side is local with filters
+			 */
+			if (sjinfo->jointype == JOIN_LEFT && foreign_on_right)
+			{
+				/* LEFT JOIN: local_filtered LEFT JOIN foreign */
+				local_relid = bms_next_member(sjinfo->syn_lefthand, -1);
+				elog(DEBUG1, "LEFT JOIN: checking left side (local) relid=%d for filters", local_relid);
+			}
+			else if (sjinfo->jointype == JOIN_RIGHT && foreign_on_left)
+			{
+				/* RIGHT JOIN: foreign RIGHT JOIN local_filtered */
+				local_relid = bms_next_member(sjinfo->syn_righthand, -1);
+				elog(DEBUG1, "RIGHT JOIN: checking right side (local) relid=%d for filters", local_relid);
+			}
+			else if (sjinfo->jointype == JOIN_FULL)
+			{
+				/* FULL JOIN: check both sides, optimize if either local side has filters */
+				if (foreign_on_left)
+				{
+					local_relid = bms_next_member(sjinfo->syn_righthand, -1);
+					elog(DEBUG1, "FULL JOIN: foreign on left, checking right side relid=%d", local_relid);
+				}
+				else if (foreign_on_right)
+				{
+					local_relid = bms_next_member(sjinfo->syn_lefthand, -1);
+					elog(DEBUG1, "FULL JOIN: foreign on right, checking left side relid=%d", local_relid);
+				}
+			}
+			else
+			{
+				elog(DEBUG1, "Outer join configuration not suitable for optimization (jointype=%d, foreign_on_left=%d, foreign_on_right=%d)",
+					 sjinfo->jointype, foreign_on_left, foreign_on_right);
+			}
+			
+			if (local_relid == 0)
+			{
+				elog(DEBUG1, "No suitable local relation found for outer join optimization");
+				continue;
+			}
+			
+			/* Get the local relation and check if it has filters */
+			local_rel = find_base_rel(root, local_relid);
+			if (!local_rel)
+			{
+				elog(DEBUG1, "Could not find base relation for local_relid=%d", local_relid);
+				continue;
+			}
+			
+			/* Check if local side has filters (WHERE clauses) */
+			if (local_rel->baserestrictinfo == NIL)
+			{
+				elog(DEBUG1, "Local relation %d has no filters, skipping optimization", local_relid);
+				continue;
+			}
+			
+			elog(DEBUG1, "Local relation %d has %d filter(s) - optimization possible!",
+				 local_relid, list_length(local_rel->baserestrictinfo));
+			
+			/*
+			 * Extract the join column name from the join expressions
+			 */
+			join_column = extract_join_column_name(root, sjinfo, local_relid, baserel->relid);
+			
+			if (join_column == NULL)
+			{
+				elog(DEBUG1, "Could not extract join column name, skipping optimization");
+				continue;
+			}
+			
+			elog(DEBUG1, "Extracted join column: %s", join_column);
+			
+			/*
+			 * Collect distinct keys from the filtered local table.
+			 * These keys will be pushed to DuckDB as a WHERE IN clause.
+			 */
+			{
+				int64 distinct_count;
+				int64 num_keys = 0;
+				const int64 MAX_KEYS_LIMIT = 5000000;
+				List *local_restrictions = local_rel->baserestrictinfo;
+				
+				elog(DEBUG1, "Counting distinct keys in local table %d on column '%s'...",
+					 local_relid, join_column);
+				
+				distinct_count = sqlite_count_distinct_keys_in_local_table(
+					root, local_relid, join_column, local_restrictions);
+				
+				elog(DEBUG1, "Key count result: %ld", distinct_count);
+				
+				if (distinct_count <= 0)
+				{
+					elog(DEBUG1, "No keys to collect, aborting optimization");
+					pfree(join_column);
+					continue;
+				}
+				else if (distinct_count > MAX_KEYS_LIMIT)
+				{
+					elog(DEBUG1, "Outer join: %ld keys exceeds limit (%ld), using first %ld keys",
+						 distinct_count, MAX_KEYS_LIMIT, MAX_KEYS_LIMIT);
+					distinct_count = MAX_KEYS_LIMIT;
+				}
+				else if (distinct_count > 100000)
+				{
+					elog(DEBUG1, "Outer join: skipping optimization, %ld keys exceeds threshold (100K)",
+						 distinct_count);
+					pfree(join_column);
+					continue;
+				}
+				else
+				{
+					elog(DEBUG1, "Outer join: %ld keys within limit", distinct_count);
+				}
+				
+				/* Collect the actual key values using binary encoding */
+				if (distinct_count > 0)
+				{
+					StringInfo binary_keys;
+					int64 encoded_size;
+					
+					elog(DEBUG1, "Collecting %ld keys from local table...", distinct_count);
+					
+					binary_keys = sqlite_collect_local_keys_binary(
+						root, local_relid, join_column,
+						&num_keys, distinct_count, &encoded_size, local_restrictions);
+					
+					elog(DEBUG1, "Collection result: binary_keys=%p, num_keys=%ld, encoded_size=%ld",
+						 binary_keys, num_keys, encoded_size);
+					
+					if (binary_keys != NULL && num_keys > 0)
+					{
+						/*
+						 * Reuse the inner_join fields since the mechanism is identical:
+						 * - Collect keys from filtered local table
+						 * - Push WHERE IN clause to foreign table
+						 */
+						fpinfo->is_inner_join_pushdown_safe = true;
+						fpinfo->inner_join_local_relid = local_relid;
+						fpinfo->inner_join_foreign_relid = baserel->relid;
+						fpinfo->inner_join_column_name = pstrdup(join_column);
+						fpinfo->inner_join_num_keys = num_keys;
+						fpinfo->inner_join_keys_binary = (char *) palloc(encoded_size);
+						memcpy(fpinfo->inner_join_keys_binary, binary_keys->data, encoded_size);
+						fpinfo->inner_join_keys_binary_size = encoded_size;
+						
+						pfree(binary_keys);
+						
+						elog(DEBUG1, "*** OUTER JOIN OPTIMIZATION: Successfully collected %ld keys (%ld bytes) for column '%s' ***",
+							 num_keys, encoded_size, join_column);
+						elog(DEBUG1, "*** Join type: %s, Local relid: %d, Foreign relid: %d ***",
+							 sjinfo->jointype == JOIN_LEFT ? "LEFT" :
+							 sjinfo->jointype == JOIN_RIGHT ? "RIGHT" : "FULL",
+							 local_relid, baserel->relid);
+					}
+					else
+					{
+						elog(DEBUG1, "Failed to collect keys for outer join");
+					}
+					
+					pfree(join_column);
+				}
+			}
+			
+			/* Successfully optimized this outer join */
+			break;
+		}
 	}
 }
 	/*
@@ -2008,10 +2277,10 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 		const int64 MAX_KEYS_LIMIT = 5000000;  /* Allow up to 5M keys */
 		bool optimization_applied = false;
 
-		elog(NOTICE, "=== INNER JOIN OPTIMIZATION: Starting check for baserel %d ===", baserel->relid);
-		elog(NOTICE, "scan_clauses length: %d (was empty - join clauses not there yet)", list_length(scan_clauses));
-		elog(NOTICE, "eq_classes length: %d", list_length(root->eq_classes));
-		elog(NOTICE, "simple_rel_array_size: %d", root->simple_rel_array_size);
+		elog(DEBUG1, "=== INNER JOIN OPTIMIZATION: Starting check for baserel %d ===", baserel->relid);
+		elog(DEBUG1, "scan_clauses length: %d (was empty - join clauses not there yet)", list_length(scan_clauses));
+		elog(DEBUG1, "eq_classes length: %d", list_length(root->eq_classes));
+		elog(DEBUG1, "simple_rel_array_size: %d", root->simple_rel_array_size);
 		
 		/*
 		 * Iterate through equivalence classes to find equality relationships between
@@ -2026,7 +2295,7 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			int local_relid = -1;
 			RelOptInfo *local_rel = NULL;
 			
-			elog(NOTICE, "Examining equivalence class with %d members...", list_length(ec->ec_members));
+			elog(DEBUG1, "Examining equivalence class with %d members...", list_length(ec->ec_members));
 			
 			/*
 			 * Check if this equivalence class contains our foreign baserel.
@@ -2041,14 +2310,14 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 				{
 					has_foreign = true;
 					em_foreign = em;
-					elog(NOTICE, "  EC contains our foreign relation %d", baserel->relid);
+					elog(DEBUG1, "  EC contains our foreign relation %d", baserel->relid);
 					break;
 				}
 			}
 			
 			if (!has_foreign)
 			{
-				elog(NOTICE, "  EC does not contain our foreign relation, skipping");
+				elog(DEBUG1, "  EC does not contain our foreign relation, skipping");
 				continue;
 			}
 			
@@ -2072,7 +2341,7 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 				
 				other_relid = bms_singleton_member(em->em_relids);
 				
-				elog(NOTICE, "    Checking EC member for relation %d...", other_relid);
+				elog(DEBUG1, "    Checking EC member for relation %d...", other_relid);
 				
 				if (other_relid >= root->simple_rel_array_size)
 					continue;
@@ -2091,18 +2360,18 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 				
 				if (other_is_foreign)
 				{
-					elog(NOTICE, "      Relation %d is foreign, skipping", other_relid);
+					elog(DEBUG1, "      Relation %d is foreign, skipping", other_relid);
 					continue;
 				}
 				
 				/* Check if has filters */
 				if (other_rel->baserestrictinfo == NIL)
 				{
-					elog(NOTICE, "      Relation %d is local but has no filters, skipping", other_relid);
+					elog(DEBUG1, "      Relation %d is local but has no filters, skipping", other_relid);
 					continue;
 				}
 				
-				elog(NOTICE, "      FOUND! Relation %d is local with %d filter(s)",
+				elog(DEBUG1, "      FOUND! Relation %d is local with %d filter(s)",
 					 other_relid, list_length(other_rel->baserestrictinfo));
 				
 				em_local = em;
@@ -2113,7 +2382,7 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			
 			if (!em_local || local_relid < 0 || !local_rel)
 			{
-				elog(NOTICE, "  No suitable local relation found in this EC");
+				elog(DEBUG1, "  No suitable local relation found in this EC");
 				continue;
 			}
 			
@@ -2132,7 +2401,7 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 				if (local_join_column)
 				{
 					local_join_column = pstrdup(local_join_column);
-					elog(NOTICE, "  Extracted local column: '%s'", local_join_column);
+					elog(DEBUG1, "  Extracted local column: '%s'", local_join_column);
 				}
 			}
 			
@@ -2144,13 +2413,13 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 				if (foreign_join_column)
 				{
 					foreign_join_column = pstrdup(foreign_join_column);
-					elog(NOTICE, "  Extracted foreign column: '%s'", foreign_join_column);
+					elog(DEBUG1, "  Extracted foreign column: '%s'", foreign_join_column);
 				}
 			}
 			
 			if (!local_join_column || !foreign_join_column)
 			{
-				elog(NOTICE, "  Could not extract column names, skipping");
+				elog(DEBUG1, "  Could not extract column names, skipping");
 				if (local_join_column) pfree(local_join_column);
 				if (foreign_join_column) pfree(foreign_join_column);
 				continue;
@@ -2160,31 +2429,31 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			 * We found a local table with filters that joins with our foreign table!
 			 * Now collect the filtered keys.
 			 */
-			elog(NOTICE, "=== OPTIMIZATION OPPORTUNITY DETECTED ===");
-			elog(NOTICE, "Local table (filtered): relation %d, column '%s'", local_relid, local_join_column);
-			elog(NOTICE, "Foreign table: relation %d (this scan), column '%s'", baserel->relid, foreign_join_column);
+			elog(DEBUG1, "=== OPTIMIZATION OPPORTUNITY DETECTED ===");
+			elog(DEBUG1, "Local table (filtered): relation %d, column '%s'", local_relid, local_join_column);
+			elog(DEBUG1, "Foreign table: relation %d (this scan), column '%s'", baserel->relid, foreign_join_column);
 			
-			elog(NOTICE, "Counting distinct keys in local table %d on column '%s'...",
+			elog(DEBUG1, "Counting distinct keys in local table %d on column '%s'...",
 				 local_relid, local_join_column);
 			
 			int64 distinct_count = sqlite_count_distinct_keys_in_local_table(
 				root, local_relid, local_join_column, local_rel->baserestrictinfo);
 			
-			elog(NOTICE, "Distinct key count result: %ld", distinct_count);
+			elog(DEBUG1, "Distinct key count result: %ld", distinct_count);
 			
 			if (distinct_count <= 0)
 			{
-				elog(NOTICE, "Skipping: no keys to collect (count=%ld)", distinct_count);
+				elog(DEBUG1, "Skipping: no keys to collect (count=%ld)", distinct_count);
 				pfree(local_join_column);
 				pfree(foreign_join_column);
 				continue;
 			}
 			
-			elog(NOTICE, "Found %ld distinct keys to push down", distinct_count);
+			elog(DEBUG1, "Found %ld distinct keys to push down", distinct_count);
 			
 			if (distinct_count > 100000)
 			{
-				elog(NOTICE, "Skipping: too many keys (%ld exceeds 100K threshold)", distinct_count);
+				elog(DEBUG1, "Skipping: too many keys (%ld exceeds 100K threshold)", distinct_count);
 				pfree(local_join_column);
 				pfree(foreign_join_column);
 				continue;
@@ -2193,12 +2462,12 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			int64 max_keys = distinct_count;
 			if (max_keys > MAX_KEYS_LIMIT)
 			{
-				elog(NOTICE, "Limiting keys from %ld to %ld (MAX_KEYS_LIMIT)",
+				elog(DEBUG1, "Limiting keys from %ld to %ld (MAX_KEYS_LIMIT)",
 					 distinct_count, MAX_KEYS_LIMIT);
 				max_keys = MAX_KEYS_LIMIT;
 			}
 			
-			elog(NOTICE, "Collecting %ld keys from local table...", max_keys);
+			elog(DEBUG1, "Collecting %ld keys from local table...", max_keys);
 			
 			StringInfo binary_keys = NULL;
 			int64 num_keys = 0;
@@ -2208,12 +2477,12 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 				root, local_relid, local_join_column,
 				&num_keys, max_keys, &encoded_size, local_rel->baserestrictinfo);
 			
-			elog(NOTICE, "Collection result: binary_keys=%s, num_keys=%ld, encoded_size=%ld",
+			elog(DEBUG1, "Collection result: binary_keys=%s, num_keys=%ld, encoded_size=%ld",
 				 binary_keys ? "NOT NULL" : "NULL", num_keys, encoded_size);
 			
 			if (!binary_keys || num_keys <= 0 || encoded_size <= 0)
 			{
-				elog(NOTICE, "Skipping: key collection failed");
+				elog(DEBUG1, "Skipping: key collection failed");
 				pfree(local_join_column);
 				pfree(foreign_join_column);
 				if (binary_keys)
@@ -2225,7 +2494,7 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			 * Success! Store the information for later use in BeginForeignScan.
 			 * Use the FOREIGN table's column name for the WHERE IN clause.
 			 */
-			elog(NOTICE, "SUCCESS! Storing INNER JOIN optimization data in fpinfo");
+			elog(DEBUG1, "SUCCESS! Storing INNER JOIN optimization data in fpinfo");
 			
 			fpinfo->is_inner_join_pushdown_safe = true;
 			fpinfo->inner_join_local_relid = local_relid;
@@ -2236,12 +2505,12 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			memcpy(fpinfo->inner_join_keys_binary, binary_keys->data, encoded_size);
 			fpinfo->inner_join_keys_binary_size = encoded_size;
 			
-			elog(NOTICE, "=== INNER JOIN OPTIMIZATION ENABLED ===");
-			elog(NOTICE, "Will push %ld filtered keys from local table %d to foreign table %d",
+			elog(DEBUG1, "=== INNER JOIN OPTIMIZATION ENABLED ===");
+			elog(DEBUG1, "Will push %ld filtered keys from local table %d to foreign table %d",
 				 (long) num_keys, local_relid, baserel->relid);
-			elog(NOTICE, "Join columns: local='%s', foreign='%s'", local_join_column, foreign_join_column);
-			elog(NOTICE, "Binary size: %ld bytes", encoded_size);
-			elog(NOTICE, "=======================================");
+			elog(DEBUG1, "Join columns: local='%s', foreign='%s'", local_join_column, foreign_join_column);
+			elog(DEBUG1, "Binary size: %ld bytes", encoded_size);
+			elog(DEBUG1, "=======================================");
 			
 			pfree(local_join_column);
 			/* Don't free foreign_join_column - it's stored in fpinfo */
@@ -2257,7 +2526,7 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 		
 		if (!optimization_applied)
 		{
-			elog(NOTICE, "=== INNER JOIN OPTIMIZATION: No applicable join found ===");
+			elog(DEBUG1, "=== INNER JOIN OPTIMIZATION: No applicable join found ===");
 		}
 	}
 
@@ -2561,8 +2830,8 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 	 * with a local table filtered and a foreign table, we store the filtered
 	 * keys from the local side to push down to the foreign side at execution time.
 	 */
-	elog(NOTICE, "Checking if INNER JOIN optimization data needs to be packed...");
-	elog(NOTICE, "is_inner_join_pushdown_safe=%s, keys_binary=%s, num_keys=%ld",
+	elog(DEBUG1, "Checking if INNER JOIN optimization data needs to be packed...");
+	elog(DEBUG1, "is_inner_join_pushdown_safe=%s, keys_binary=%s, num_keys=%ld",
 		 fpinfo->is_inner_join_pushdown_safe ? "TRUE" : "FALSE",
 		 fpinfo->inner_join_keys_binary ? "NOT NULL" : "NULL",
 		 fpinfo->inner_join_num_keys);
@@ -2574,8 +2843,8 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 		int binary_len;
 		char *hex_output;
 		
-		elog(NOTICE, "=== PACKING INNER JOIN DATA INTO fdw_private ===");
-		elog(NOTICE, "Keys: %ld, Binary size: %ld bytes, Column: '%s'",
+		elog(DEBUG1, "=== PACKING INNER JOIN DATA INTO fdw_private ===");
+		elog(DEBUG1, "Keys: %ld, Binary size: %ld bytes, Column: '%s'",
 			 fpinfo->inner_join_num_keys, 
 			 fpinfo->inner_join_keys_binary_size,
 			 fpinfo->inner_join_column_name);
@@ -2599,9 +2868,9 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 		/* Store binary data as Hex String */
 		fdw_private = lappend(fdw_private, makeString(hex_output));
 		
-		elog(NOTICE, "Hex encoded data length: %d characters", (int)strlen(hex_output));
-		elog(NOTICE, "fdw_private now has %d elements", list_length(fdw_private));
-		elog(NOTICE, "===============================================");
+		elog(DEBUG1, "Hex encoded data length: %d characters", (int)strlen(hex_output));
+		elog(DEBUG1, "fdw_private now has %d elements", list_length(fdw_private));
+		elog(DEBUG1, "===============================================");
 		
 		/* Can now free the temporary binary buffer from fpinfo */
 		pfree(fpinfo->inner_join_keys_binary);
@@ -2609,7 +2878,7 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 	}
 	else
 	{
-		elog(NOTICE, "No INNER JOIN optimization - adding placeholders to fdw_private");
+		elog(DEBUG1, "No INNER JOIN optimization - adding placeholders to fdw_private");
 		fdw_private = lappend(fdw_private, makeInteger(0)); /* 0 = no inner join optimization */
 		fdw_private = lappend(fdw_private, makeString(NULL)); /* Placeholder for column name */
 		fdw_private = lappend(fdw_private, makeInteger(0)); /* Placeholder for num_keys */
@@ -2867,15 +3136,15 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 	 * INNER JOIN with a filtered local table joined to a foreign table, we decode
 	 * the filtered keys here and build the final IN clause query.
 	 */
-	elog(NOTICE, "=== CHECKING FOR INNER JOIN OPTIMIZATION DATA ===");
-	elog(NOTICE, "fdw_private length: %d, FdwScanPrivateInnerJoinMarker=%d", 
+	elog(DEBUG1, "=== CHECKING FOR INNER JOIN OPTIMIZATION DATA ===");
+	elog(DEBUG1, "fdw_private length: %d, FdwScanPrivateInnerJoinMarker=%d", 
 		 list_length(fsplan->fdw_private), FdwScanPrivateInnerJoinMarker);
 		 
 	if (list_length(fsplan->fdw_private) > FdwScanPrivateInnerJoinMarker)
 	{
 		int inner_join_marker = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinMarker));
 		
-		elog(NOTICE, "Inner join marker value: %d (1=enabled, 0=disabled)", inner_join_marker);
+		elog(DEBUG1, "Inner join marker value: %d (1=enabled, 0=disabled)", inner_join_marker);
 		
 		if (inner_join_marker == 1 && list_length(fsplan->fdw_private) > FdwScanPrivateInnerJoinBinaryData)
 		{
@@ -2888,14 +3157,14 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 			char *original_query;
 			StringInfo final_query;
 			
-			elog(NOTICE, "=== INNER JOIN OPTIMIZATION: DECODING KEYS ===");
+			elog(DEBUG1, "=== INNER JOIN OPTIMIZATION: DECODING KEYS ===");
 			
 			/* Extract the column name and binary key data from fdw_private */
 			column_name = strVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinColumnName));
 			num_keys = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinNumKeys));
 			binary_size = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateInnerJoinBinarySize));
 			
-			elog(NOTICE, "Column: '%s', Num keys: %ld, Binary size: %ld", 
+			elog(DEBUG1, "Column: '%s', Num keys: %ld, Binary size: %ld", 
 				 column_name, num_keys, binary_size);
 
 			/* Extract Hex string and decode */
@@ -2904,12 +3173,12 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 				
 				if (hex_input == NULL)
 				{
-					elog(NOTICE, "ERROR: Hex string is NULL!");
+					elog(DEBUG1, "ERROR: Hex string is NULL!");
 					binary_data = NULL;
 				}
 				else
 				{
-					elog(NOTICE, "Hex string length: %d characters", (int)strlen(hex_input));
+					elog(DEBUG1, "Hex string length: %d characters", (int)strlen(hex_input));
 					
 					/* Allocate memory for binary data */
 					binary_data = (char *) palloc(binary_size);
@@ -2917,14 +3186,14 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 					/* Decode Hex string */
 					hex_decode(hex_input, strlen(hex_input), binary_data);
 					
-					elog(NOTICE, "Successfully decoded %ld keys from hex (%ld bytes)", 
+					elog(DEBUG1, "Successfully decoded %ld keys from hex (%ld bytes)", 
 						 num_keys, binary_size);
 				}
 			}
 			
 			if (binary_data != NULL && binary_size > 0)
 			{
-				elog(NOTICE, "Decoding binary keys to string...");
+				elog(DEBUG1, "Decoding binary keys to string...");
 				
 				/* Wrap in StringInfo for the decoder function */
 				binary_wrapper = makeStringInfo();
@@ -2939,12 +3208,12 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 				
 				if (decoded_keys != NULL && decoded_keys->len > 0)
 				{
-					elog(NOTICE, "Decoded keys string length: %d characters", decoded_keys->len);
+					elog(DEBUG1, "Decoded keys string length: %d characters", decoded_keys->len);
 					
 					/* Save the original query */
 					original_query = pstrdup(festate->query);
 					
-					elog(NOTICE, "Original query length: %d characters", (int)strlen(original_query));
+					elog(DEBUG1, "Original query length: %d characters", (int)strlen(original_query));
 					
 					/* Build the final query with IN clause using the actual column name */
 					final_query = makeStringInfo();
@@ -2955,10 +3224,10 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 					/* Replace the query in festate */
 					festate->query = final_query->data;
 					
-					elog(NOTICE, "=== INNER JOIN OPTIMIZATION APPLIED ===");
-					elog(NOTICE, "Added WHERE %s IN (...) with %ld keys", column_name, num_keys);
-					elog(NOTICE, "Final query size: %.2f MB", final_query->len / (1024.0 * 1024.0));
-					elog(NOTICE, "=======================================");
+					elog(DEBUG1, "=== INNER JOIN OPTIMIZATION APPLIED ===");
+					elog(DEBUG1, "Added WHERE %s IN (...) with %ld keys", column_name, num_keys);
+					elog(DEBUG1, "Final query size: %.2f MB", final_query->len / (1024.0 * 1024.0));
+					elog(DEBUG1, "=======================================");
 					
 					/* Clean up */
 					pfree(decoded_keys->data);
@@ -2967,22 +3236,22 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
 				}
 				else
 				{
-					elog(NOTICE, "ERROR: Failed to decode binary keys - using original query");
+					elog(DEBUG1, "ERROR: Failed to decode binary keys - using original query");
 				}
 			}
 			else
 			{
-				elog(NOTICE, "ERROR: No binary data found - using original query");
+				elog(DEBUG1, "ERROR: No binary data found - using original query");
 			}
 		}
 		else
 		{
-			elog(NOTICE, "Inner join marker is 0 or insufficient fdw_private elements");
+			elog(DEBUG1, "Inner join marker is 0 or insufficient fdw_private elements");
 		}
 	}
 	else
 	{
-		elog(NOTICE, "fdw_private too short - no INNER JOIN optimization data");
+		elog(DEBUG1, "fdw_private too short - no INNER JOIN optimization data");
 	}
 
 	/*
