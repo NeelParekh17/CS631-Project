@@ -1,0 +1,541 @@
+~/Desktop/assignments/DBMS/Project/duckdb/build/release/duckdb /home/neel/Desktop/assignments/DBMS/Project/duckdb_fdw/test.duckdb
+
+CREATE VIEW flights AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/flights-1m.parquet';
+
+CREATE VIEW flights1 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/flights-1m_table1.parquet';
+
+CREATE VIEW flights2 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/flights-1m_table2.parquet';
+
+CREATE VIEW yellow_tripdata AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/yellow_tripdata_2025-02.parquet';
+
+CREATE VIEW yellow_tripdata1 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/yellow_tripdata_2025-02_table1.parquet';
+
+CREATE VIEW yellow_tripdata2 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/yellow_tripdata_2025-02_table2.parquet';
+
+CREATE VIEW titanic AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/titanic.parquet';
+
+CREATE VIEW abstracts_sample AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/abstracts-sample.parquet';
+
+CREATE VIEW authors_plus AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/authors-plus.parquet';
+
+CREATE VIEW authors_plus1 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/authors-plus_table1.parquet';
+
+CREATE VIEW authors_plus2 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/authors-plus_table2.parquet';
+
+CREATE VIEW authors_sample AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/authors-sample.parquet';
+
+CREATE VIEW citations_sample AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/citations-sample.parquet';
+
+CREATE VIEW citations_bulk_full_table1 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/citations_bulk_full_table1.parquet';
+
+CREATE VIEW citations_bulk_full_table2 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/citations_bulk_full_table2.parquet';
+
+CREATE VIEW citations_bulk_table1 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/citations_bulk_table1.parquet';
+
+CREATE VIEW citations_bulk_table2 AS
+SELECT * FROM '/home/neel/Desktop/assignments/DBMS/Project_test/parquet_files/citations_bulk_table2.parquet';
+
+~/Desktop/assignments/DBMS/Project_test/postgresql/install/bin/pg_ctl -D ~/Desktop/assignments/DBMS/Project_test/pgdata start
+
+~/Desktop/assignments/DBMS/Project_test/postgresql/install/bin/psql -d postgres
+
+postgres=# CREATE EXTENSION duckdb_fdw;
+CREATE EXTENSION
+
+postgres=# CREATE SERVER duckdb_server FOREIGN DATA WRAPPER duckdb_fdw
+OPTIONS (database '/home/neel/Desktop/assignments/DBMS/Project_test/duckdb_fdw/test.duckdb');
+CREATE SERVER
+
+postgres=# IMPORT FOREIGN SCHEMA main
+  LIMIT TO (
+    flights,
+    flights1,
+    flights2,
+    yellow_tripdata,
+    yellow_tripdata1,
+    yellow_tripdata2,
+    titanic,
+    abstracts_sample,
+    authors_plus,
+    authors_plus1,
+    authors_plus2,
+    authors_sample,
+    citations_sample,
+    citations_bulk_full_table1,
+    citations_bulk_full_table2,
+    citations_bulk_table1,
+    citations_bulk_table2
+  )
+FROM SERVER duckdb_server
+INTO public;
+IMPORT FOREIGN SCHEMA
+
+
+
+Creating Local table:
+
+CREATE TABLE abstracts_sample_pg AS SELECT * FROM abstracts_sample;
+CREATE TABLE authors_plus_pg     AS SELECT * FROM authors_plus;
+CREATE TABLE authors_plus1_pg    AS SELECT * FROM authors_plus1;
+CREATE TABLE authors_plus2_pg    AS SELECT * FROM authors_plus2;
+CREATE TABLE authors_sample_pg   AS SELECT * FROM authors_sample;
+CREATE TABLE citations_sample_pg AS SELECT * FROM citations_sample;
+CREATE TABLE flights_pg          AS SELECT * FROM flights;
+CREATE TABLE flights1_pg         AS SELECT * FROM flights1;
+CREATE TABLE flights2_pg         AS SELECT * FROM flights2;
+CREATE TABLE titanic_pg          AS SELECT * FROM titanic;
+CREATE TABLE yellow_tripdata_pg  AS SELECT * FROM yellow_tripdata;
+CREATE TABLE yellow_tripdata1_pg AS SELECT * FROM yellow_tripdata1;
+CREATE TABLE yellow_tripdata2_pg AS SELECT * FROM yellow_tripdata2;
+CREATE TABLE citations_bulk_full_table1_pg AS SELECT * FROM citations_bulk_full_table1;
+CREATE TABLE citations_bulk_full_table2_pg AS SELECT * FROM citations_bulk_full_table2;
+CREATE TABLE citations_bulk_table1_pg AS SELECT * FROM citations_bulk_table1;
+CREATE TABLE citations_bulk_table2_pg AS SELECT * FROM citations_bulk_table2;
+
+postgres=# \d
+                  List of relations
+ Schema |        Name         |     Type      | Owner 
+--------+---------------------+---------------+-------
+ public | abstracts_sample    | foreign table | neel
+ public | abstracts_sample_pg | table         | neel
+ public | authors_plus        | foreign table | neel
+ public | authors_plus1       | foreign table | neel
+ public | authors_plus1_pg    | table         | neel
+ public | authors_plus2       | foreign table | neel
+ public | authors_plus2_pg    | table         | neel
+ public | authors_plus_pg     | table         | neel
+ public | authors_sample      | foreign table | neel
+ public | authors_sample_pg   | table         | neel
+ public | citations_sample    | foreign table | neel
+ public | citations_sample_pg | table         | neel
+ public | flights             | foreign table | neel
+ public | flights1            | foreign table | neel
+ public | flights1_pg         | table         | neel
+ public | flights2            | foreign table | neel
+ public | flights2_pg         | table         | neel
+ public | flights_pg          | table         | neel
+ public | titanic             | foreign table | neel
+ public | titanic_pg          | table         | neel
+ public | yellow_tripdata     | foreign table | neel
+ public | yellow_tripdata1    | foreign table | neel
+ public | yellow_tripdata1_pg | table         | neel
+ public | yellow_tripdata2    | foreign table | neel
+ public | yellow_tripdata2_pg | table         | neel
+ public | yellow_tripdata_pg  | table         | neel
+(26 rows)
+
+
+postgres=# \d flights
+                       Foreign table "public.flights"
+  Column   |       Type       | Collation | Nullable | Default | FDW options 
+-----------+------------------+-----------+----------+---------+-------------
+ FL_DATE   | date             |           |          |         | 
+ DEP_DELAY | bigint           |           |          |         | 
+ ARR_DELAY | bigint           |           |          |         | 
+ AIR_TIME  | bigint           |           |          |         | 
+ DISTANCE  | bigint           |           |          |         | 
+ DEP_TIME  | double precision |           |          |         | 
+ ARR_TIME  | double precision |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.flights')
+
+
+postgres=# \d titanic
+                         Foreign table "public.titanic"
+   Column    |       Type        | Collation | Nullable | Default | FDW options 
+-------------+-------------------+-----------+----------+---------+-------------
+ PassengerId | bigint            |           |          |         | 
+ Survived    | bigint            |           |          |         | 
+ Pclass      | bigint            |           |          |         | 
+ Name        | character varying |           |          |         | 
+ Sex         | character varying |           |          |         | 
+ Age         | double precision  |           |          |         | 
+ SibSp       | bigint            |           |          |         | 
+ Parch       | bigint            |           |          |         | 
+ Ticket      | character varying |           |          |         | 
+ Fare        | double precision  |           |          |         | 
+ Cabin       | character varying |           |          |         | 
+ Embarked    | character varying |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.titanic')
+
+
+postgres=# \d yellow_tripdata
+                               Foreign table "public.yellow_tripdata"
+        Column         |            Type             | Collation | Nullable | Default | FDW options 
+-----------------------+-----------------------------+-----------+----------+---------+-------------
+ VendorID              | bigint                      |           |          |         | 
+ tpep_pickup_datetime  | timestamp without time zone |           |          |         | 
+ tpep_dropoff_datetime | timestamp without time zone |           |          |         | 
+ passenger_count       | bigint                      |           |          |         | 
+ trip_distance         | double precision            |           |          |         | 
+ RatecodeID            | bigint                      |           |          |         | 
+ store_and_fwd_flag    | character varying           |           |          |         | 
+ PULocationID          | bigint                      |           |          |         | 
+ DOLocationID          | bigint                      |           |          |         | 
+ payment_type          | bigint                      |           |          |         | 
+ fare_amount           | double precision            |           |          |         | 
+ extra                 | double precision            |           |          |         | 
+ mta_tax               | double precision            |           |          |         | 
+ tip_amount            | double precision            |           |          |         | 
+ tolls_amount          | double precision            |           |          |         | 
+ improvement_surcharge | double precision            |           |          |         | 
+ total_amount          | double precision            |           |          |         | 
+ congestion_surcharge  | double precision            |           |          |         | 
+ Airport_fee           | double precision            |           |          |         | 
+ cbd_congestion_fee    | double precision            |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.yellow_tripdata')
+
+
+postgres=# \d flights1
+                   Foreign table "public.flights1"
+    Column    |  Type  | Collation | Nullable | Default | FDW options 
+--------------+--------+-----------+----------+---------+-------------
+ index_column | bigint |           |          |         | 
+ FL_DATE      | date   |           |          |         | 
+ DEP_DELAY    | bigint |           |          |         | 
+ ARR_DELAY    | bigint |           |          |         | 
+ AIR_TIME     | bigint |           |          |         | 
+ DISTANCE     | bigint |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.flights1')
+
+
+postgres=# \d flights2
+                        Foreign table "public.flights2"
+    Column    |       Type       | Collation | Nullable | Default | FDW options 
+--------------+------------------+-----------+----------+---------+-------------
+ index_column | bigint           |           |          |         | 
+ DEP_TIME     | double precision |           |          |         | 
+ ARR_TIME     | double precision |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.flights2')
+
+
+postgres=# \d yellow_tripdata1
+                              Foreign table "public.yellow_tripdata1"
+        Column         |            Type             | Collation | Nullable | Default | FDW options 
+-----------------------+-----------------------------+-----------+----------+---------+-------------
+ index_column          | bigint                      |           |          |         | 
+ VendorID              | bigint                      |           |          |         | 
+ tpep_pickup_datetime  | timestamp without time zone |           |          |         | 
+ tpep_dropoff_datetime | timestamp without time zone |           |          |         | 
+ passenger_count       | double precision            |           |          |         | 
+ trip_distance         | double precision            |           |          |         | 
+ RatecodeID            | double precision            |           |          |         | 
+ store_and_fwd_flag    | character varying           |           |          |         | 
+ PULocationID          | bigint                      |           |          |         | 
+ DOLocationID          | bigint                      |           |          |         | 
+ payment_type          | bigint                      |           |          |         | 
+ fare_amount           | double precision            |           |          |         | 
+ extra                 | double precision            |           |          |         | 
+ mta_tax               | double precision            |           |          |         | 
+ tip_amount            | double precision            |           |          |         | 
+ tolls_amount          | double precision            |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.yellow_tripdata1')
+
+
+postgres=# \d yellow_tripdata2
+                         Foreign table "public.yellow_tripdata2"
+        Column         |       Type       | Collation | Nullable | Default | FDW options 
+-----------------------+------------------+-----------+----------+---------+-------------
+ index_column          | bigint           |           |          |         | 
+ improvement_surcharge | double precision |           |          |         | 
+ total_amount          | double precision |           |          |         | 
+ congestion_surcharge  | double precision |           |          |         | 
+ Airport_fee           | double precision |           |          |         | 
+ cbd_congestion_fee    | double precision |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.yellow_tripdata2')
+
+
+postgres=# \d abstracts_sample
+                   Foreign table "public.abstracts_sample"
+  Column  |       Type        | Collation | Nullable | Default | FDW options 
+----------+-------------------+-----------+----------+---------+-------------
+ corpusid | bigint            |           |          |         | 
+ abstract | character varying |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.abstracts_sample')
+
+
+postgres=# \d authors_plus
+                        Foreign table "public.authors_plus"
+    Column     |        Type         | Collation | Nullable | Default | FDW options 
+---------------+---------------------+-----------+----------+---------+-------------
+ authorid      | bigint              |           |          |         | 
+ url           | character varying   |           |          |         | 
+ name          | character varying   |           |          |         | 
+ aliases       | character varying[] |           |          |         | 
+ affiliations  | character varying[] |           |          |         | 
+ homepage      | character varying   |           |          |         | 
+ papercount    | double precision    |           |          |         | 
+ citationcount | bigint              |           |          |         | 
+ hindex        | bigint              |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.authors_plus')
+
+
+postgres=# \d authors_plus1
+                       Foreign table "public.authors_plus1"
+    Column    |        Type         | Collation | Nullable | Default | FDW options 
+--------------+---------------------+-----------+----------+---------+-------------
+ index_column | bigint              |           |          |         | 
+ authorid     | bigint              |           |          |         | 
+ externalids  | text                |           |          |         | 
+ url          | character varying   |           |          |         | 
+ name         | character varying   |           |          |         | 
+ aliases      | character varying[] |           |          |         | 
+ affiliations | character varying[] |           |          |         | 
+ homepage     | character varying   |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.authors_plus1')
+
+
+postgres=# \d authors_plus2
+                      Foreign table "public.authors_plus2"
+    Column     |       Type       | Collation | Nullable | Default | FDW options 
+---------------+------------------+-----------+----------+---------+-------------
+ index_column  | bigint           |           |          |         | 
+ papercount    | double precision |           |          |         | 
+ citationcount | bigint           |           |          |         | 
+ hindex        | bigint           |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.authors_plus2')
+
+
+postgres=# \d authors_sample
+                       Foreign table "public.authors_sample"
+    Column     |        Type         | Collation | Nullable | Default | FDW options 
+---------------+---------------------+-----------+----------+---------+-------------
+ authorid      | bigint              |           |          |         | 
+ url           | character varying   |           |          |         | 
+ name          | character varying   |           |          |         | 
+ aliases       | character varying[] |           |          |         | 
+ affiliations  | double precision    |           |          |         | 
+ homepage      | double precision    |           |          |         | 
+ papercount    | double precision    |           |          |         | 
+ citationcount | bigint              |           |          |         | 
+ hindex        | bigint              |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.authors_sample')
+
+
+postgres=# \d citations_sample
+                       Foreign table "public.citations_sample"
+     Column     |        Type         | Collation | Nullable | Default | FDW options 
+----------------+---------------------+-----------+----------+---------+-------------
+ citationid     | bigint              |           |          |         | 
+ citingcorpusid | bigint              |           |          |         | 
+ citedcorpusid  | double precision    |           |          |         | 
+ isinfluential  | boolean             |           |          |         | 
+ contexts       | character varying[] |           |          |         | 
+ intents        | character varying[] |           |          |         | 
+Server: duckdb_svr
+FDW options: ("table" 'test.main.citations_sample')
+
+
+postgres=# \d flights_pg
+                   Table "public.flights_pg"
+  Column   |       Type       | Collation | Nullable | Default 
+-----------+------------------+-----------+----------+---------
+ FL_DATE   | date             |           |          | 
+ DEP_DELAY | bigint           |           |          | 
+ ARR_DELAY | bigint           |           |          | 
+ AIR_TIME  | bigint           |           |          | 
+ DISTANCE  | bigint           |           |          | 
+ DEP_TIME  | double precision |           |          | 
+ ARR_TIME  | double precision |           |          |
+
+
+postgres=# \d titanic_pg
+                    Table "public.titanic_pg"
+   Column    |       Type        | Collation | Nullable | Default 
+-------------+-------------------+-----------+----------+---------
+ PassengerId | bigint            |           |          | 
+ Survived    | bigint            |           |          | 
+ Pclass      | bigint            |           |          | 
+ Name        | character varying |           |          | 
+ Sex         | character varying |           |          | 
+ Age         | double precision  |           |          | 
+ SibSp       | bigint            |           |          | 
+ Parch       | bigint            |           |          | 
+ Ticket      | character varying |           |          | 
+ Fare        | double precision  |           |          | 
+ Cabin       | character varying |           |          | 
+ Embarked    | character varying |           |          |
+
+
+postgres=# \d yellow_tripdata_pg
+                          Table "public.yellow_tripdata_pg"
+        Column         |            Type             | Collation | Nullable | Default 
+-----------------------+-----------------------------+-----------+----------+---------
+ VendorID              | bigint                      |           |          | 
+ tpep_pickup_datetime  | timestamp without time zone |           |          | 
+ tpep_dropoff_datetime | timestamp without time zone |           |          | 
+ passenger_count       | bigint                      |           |          | 
+ trip_distance         | double precision            |           |          | 
+ RatecodeID            | bigint                      |           |          | 
+ store_and_fwd_flag    | character varying           |           |          | 
+ PULocationID          | bigint                      |           |          | 
+ DOLocationID          | bigint                      |           |          | 
+ payment_type          | bigint                      |           |          | 
+ fare_amount           | double precision            |           |          | 
+ extra                 | double precision            |           |          | 
+ mta_tax               | double precision            |           |          | 
+ tip_amount            | double precision            |           |          | 
+ tolls_amount          | double precision            |           |          | 
+ improvement_surcharge | double precision            |           |          | 
+ total_amount          | double precision            |           |          | 
+ congestion_surcharge  | double precision            |           |          | 
+ Airport_fee           | double precision            |           |          | 
+ cbd_congestion_fee    | double precision            |           |          |
+
+
+postgres=# \d flights1_pg
+               Table "public.flights1_pg"
+    Column    |  Type  | Collation | Nullable | Default 
+--------------+--------+-----------+----------+---------
+ index_column | bigint |           |          | 
+ FL_DATE      | date   |           |          | 
+ DEP_DELAY    | bigint |           |          | 
+ ARR_DELAY    | bigint |           |          | 
+ AIR_TIME     | bigint |           |          | 
+ DISTANCE     | bigint |           |          |
+
+
+postgres=# \d flights2_pg
+                    Table "public.flights2_pg"
+    Column    |       Type       | Collation | Nullable | Default 
+--------------+------------------+-----------+----------+---------
+ index_column | bigint           |           |          | 
+ DEP_TIME     | double precision |           |          | 
+ ARR_TIME     | double precision |           |          |
+
+
+postgres=# \d yellow_tripdata1_pg
+                          Table "public.yellow_tripdata1_pg"
+        Column         |            Type             | Collation | Nullable | Default 
+-----------------------+-----------------------------+-----------+----------+---------
+ index_column          | bigint                      |           |          | 
+ VendorID              | bigint                      |           |          | 
+ tpep_pickup_datetime  | timestamp without time zone |           |          | 
+ tpep_dropoff_datetime | timestamp without time zone |           |          | 
+ passenger_count       | double precision            |           |          | 
+ trip_distance         | double precision            |           |          | 
+ RatecodeID            | double precision            |           |          | 
+ store_and_fwd_flag    | character varying           |           |          | 
+ PULocationID          | bigint                      |           |          | 
+ DOLocationID          | bigint                      |           |          | 
+ payment_type          | bigint                      |           |          | 
+ fare_amount           | double precision            |           |          | 
+ extra                 | double precision            |           |          | 
+ mta_tax               | double precision            |           |          | 
+ tip_amount            | double precision            |           |          | 
+ tolls_amount          | double precision            |           |          |
+
+
+postgres=# \d yellow_tripdata2_pg
+                    Table "public.yellow_tripdata2_pg"
+        Column         |       Type       | Collation | Nullable | Default 
+-----------------------+------------------+-----------+----------+---------
+ index_column          | bigint           |           |          | 
+ improvement_surcharge | double precision |           |          | 
+ total_amount          | double precision |           |          | 
+ congestion_surcharge  | double precision |           |          | 
+ Airport_fee           | double precision |           |          | 
+ cbd_congestion_fee    | double precision |           |          |
+
+
+postgres=# \d abstracts_sample_pg
+              Table "public.abstracts_sample_pg"
+  Column  |       Type        | Collation | Nullable | Default 
+----------+-------------------+-----------+----------+---------
+ corpusid | bigint            |           |          | 
+ abstract | character varying |           |          |
+
+
+postgres=# \d authors_plus_pg
+                    Table "public.authors_plus_pg"
+    Column     |        Type         | Collation | Nullable | Default 
+---------------+---------------------+-----------+----------+---------
+ authorid      | bigint              |           |          | 
+ url           | character varying   |           |          | 
+ name          | character varying   |           |          | 
+ aliases       | character varying[] |           |          | 
+ affiliations  | character varying[] |           |          | 
+ homepage      | character varying   |           |          | 
+ papercount    | double precision    |           |          | 
+ citationcount | bigint              |           |          | 
+ hindex        | bigint              |           |          |
+
+
+postgres=# \d authors_plus1_pg
+                   Table "public.authors_plus1_pg"
+    Column    |        Type         | Collation | Nullable | Default 
+--------------+---------------------+-----------+----------+---------
+ index_column | bigint              |           |          | 
+ authorid     | bigint              |           |          | 
+ externalids  | text                |           |          | 
+ url          | character varying   |           |          | 
+ name         | character varying   |           |          | 
+ aliases      | character varying[] |           |          | 
+ affiliations | character varying[] |           |          | 
+ homepage     | character varying   |           |          |
+
+
+postgres=# \d authors_plus2_pg
+                  Table "public.authors_plus2_pg"
+    Column     |       Type       | Collation | Nullable | Default 
+---------------+------------------+-----------+----------+---------
+ index_column  | bigint           |           |          | 
+ papercount    | double precision |           |          | 
+ citationcount | bigint           |           |          | 
+ hindex        | bigint           |           |          |
+
+
+postgres=# \d authors_sample_pg
+                   Table "public.authors_sample_pg"
+    Column     |        Type         | Collation | Nullable | Default 
+---------------+---------------------+-----------+----------+---------
+ authorid      | bigint              |           |          | 
+ url           | character varying   |           |          | 
+ name          | character varying   |           |          | 
+ aliases       | character varying[] |           |          | 
+ affiliations  | double precision    |           |          | 
+ homepage      | double precision    |           |          | 
+ papercount    | double precision    |           |          | 
+ citationcount | bigint              |           |          | 
+ hindex        | bigint              |           |          |
+
+
+postgres=# \d citations_sample_pg
+                  Table "public.citations_sample_pg"
+     Column     |        Type         | Collation | Nullable | Default 
+----------------+---------------------+-----------+----------+---------
+ citationid     | bigint              |           |          | 
+ citingcorpusid | bigint              |           |          | 
+ citedcorpusid  | double precision    |           |          | 
+ isinfluential  | boolean             |           |          | 
+ contexts       | character varying[] |           |          |
+
+
+ sudo systemctl start docker

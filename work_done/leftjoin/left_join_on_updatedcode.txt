@@ -1,0 +1,491 @@
+===============================================================================
+LEFT JOIN QUERIES FOR SPLIT TABLES - ALL 4 COMBINATIONS
+===============================================================================
+
+This file contains LEFT JOIN queries for the following table pairs:
+1. authors_plus1 + authors_plus2
+2. flights1 + flights2
+3. yellow_tripdata1 + yellow_tripdata2
+4. citations_bulk_table1 + citations_bulk_table2
+
+Each pair has 4 versions:
+- Version 1: Both Local (pg tables)
+- Version 2: Both Foreign (duckdb tables via FDW)
+- Version 3: First Local, Second Foreign
+- Version 4: First Foreign, Second Local
+
+Each query applies a predicate on the **first table** to select fewer rows.
+
+
+===============================================================================
+TABLE PAIR 1: authors_plus1 + authors_plus2
+===============================================================================
+
+--- Version 1: Both Local ---
+EXPLAIN ANALYZE
+SELECT DISTINCT a1.authorid, a1.name, a1.url, a1.affiliations
+FROM authors_plus1_pg a1
+LEFT JOIN authors_plus2_pg a2
+  ON a1.index_column = a2.index_column
+WHERE a1.index_column < 1000;
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=133562.04..133668.69 rows=810 width=164) (actual time=192.791..194.211 rows=1000 loops=1)
+   ->  Gather Merge  (cost=133562.04..133660.59 rows=810 width=164) (actual time=192.790..194.086 rows=1000 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Unique  (cost=132562.01..132567.07 rows=405 width=164) (actual time=184.366..184.437 rows=333 loops=3)
+               ->  Sort  (cost=132562.01..132563.02 rows=405 width=164) (actual time=184.366..184.392 rows=333 loops=3)
+                     Sort Key: a1.authorid, a1.name, a1.url, a1.affiliations
+                     Sort Method: quicksort  Memory: 25kB
+                     Worker 0:  Sort Method: quicksort  Memory: 115kB
+                     Worker 1:  Sort Method: quicksort  Memory: 25kB
+                     ->  Parallel Hash Right Join  (cost=83275.26..132544.47 rows=405 width=164) (actual time=140.372..184.250 rows=333 loops=3)
+                           Hash Cond: (a2.index_column = a1.index_column)
+                           ->  Parallel Seq Scan on authors_plus2_pg a2  (cost=0.00..43388.75 rows=1567675 width=8) (actual time=0.036..56.654 rows=1254140 loops=3)
+                           ->  Parallel Hash  (cost=83270.19..83270.19 rows=405 width=172) (actual time=52.325..52.325 rows=333 loops=3)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 136kB
+                                 ->  Parallel Seq Scan on authors_plus1_pg a1  (cost=0.00..83270.19 rows=405 width=172) (actual time=32.194..52.243 rows=333 loops=3)
+                                       Filter: (index_column < 1000)
+                                       Rows Removed by Filter: 1253806
+ Planning Time: 0.084 ms
+ Execution Time: 194.266 ms
+(20 rows)
+Output Tuples: 1000
+
+--- Version 2: Both Foreign ---
+EXPLAIN ANALYZE
+SELECT DISTINCT a1.authorid, a1.name, a1.url, a1.affiliations
+FROM authors_plus1 a1
+LEFT JOIN authors_plus2 a2
+  ON a1.index_column = a2.index_column
+WHERE a1.index_column < 1000;
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Unique  (cost=10.00..10.10 rows=10 width=104) (actual time=37.040..38.015 rows=1000 loops=1)
+   ->  Foreign Scan  (cost=10.00..10.00 rows=10 width=104) (actual time=37.034..37.851 rows=1000 loops=1)
+ Planning Time: 0.167 ms
+ Execution Time: 39.146 ms
+(4 rows)
+Output Tuples: 1000
+
+
+--- Version 3: First Local, Second Foreign ---
+EXPLAIN ANALYZE
+SELECT DISTINCT a1.authorid, a1.name, a1.url, a1.affiliations
+FROM authors_plus1_pg a1
+LEFT JOIN authors_plus2 a2
+  ON a1.index_column = a2.index_column
+WHERE a1.index_column < 1000;
+                                                                        QUERY PLAN                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=87321.59..87333.75 rows=973 width=164) (actual time=67.384..68.530 rows=1000 loops=1)
+   ->  Sort  (cost=87321.59..87324.02 rows=973 width=164) (actual time=67.383..68.407 rows=1000 loops=1)
+         Sort Key: a1.authorid, a1.name, a1.url, a1.affiliations
+         Sort Method: quicksort  Memory: 115kB
+         ->  Hash Left Join  (cost=3592.00..87273.30 rows=973 width=164) (actual time=17.197..68.203 rows=1000 loops=1)
+               Hash Cond: (a1.index_column = a2.index_column)
+               ->  Gather  (cost=1000.00..84367.49 rows=973 width=172) (actual time=0.165..51.057 rows=1000 loops=1)
+                     Workers Planned: 2
+                     Workers Launched: 2
+                     ->  Parallel Seq Scan on authors_plus1_pg a1  (cost=0.00..83270.19 rows=405 width=172) (actual time=36.073..52.664 rows=333 loops=3)
+                           Filter: (index_column < 1000)
+                           Rows Removed by Filter: 1253806
+               ->  Hash  (cost=2560.00..2560.00 rows=2560 width=8) (actual time=17.026..17.028 rows=1000 loops=1)
+                     Buckets: 4096  Batches: 1  Memory Usage: 72kB
+                     ->  Foreign Scan on authors_plus2 a2  (cost=10.00..2560.00 rows=2560 width=8) (actual time=16.721..16.936 rows=1000 loops=1)
+ Planning Time: 209.751 ms
+ Execution Time: 71.746 ms
+(17 rows)
+Output Tuples: 1000
+
+
+--- Version 4: First Foreign, Second Local ---
+EXPLAIN ANALYZE
+SELECT DISTINCT a1.authorid, a1.name, a1.url, a1.affiliations
+FROM authors_plus1 a1
+LEFT JOIN authors_plus2_pg a2
+  ON a1.index_column = a2.index_column
+WHERE a1.index_column < 1000;
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+                                                                   QUERY PLAN                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=79463.18..79465.69 rows=141 width=104) (actual time=389.514..389.710 rows=1000 loops=1)
+   ->  Sort  (cost=79463.18..79463.68 rows=201 width=104) (actual time=389.513..389.585 rows=1000 loops=1)
+         Sort Key: a1.authorid, a1.name, a1.url, a1.affiliations
+         Sort Method: quicksort  Memory: 115kB
+         ->  Hash Right Join  (cost=10.12..79455.49 rows=201 width=104) (actual time=23.418..389.363 rows=1000 loops=1)
+               Hash Cond: (a2.index_column = a1.index_column)
+               ->  Seq Scan on authors_plus2_pg a2  (cost=0.00..65336.19 rows=3762419 width=8) (actual time=0.039..161.038 rows=3762419 loops=1)
+               ->  Hash  (cost=10.00..10.00 rows=10 width=112) (actual time=23.366..23.367 rows=1000 loops=1)
+                     Buckets: 1024  Batches: 1  Memory Usage: 123kB
+                     ->  Foreign Scan on authors_plus1 a1  (cost=10.00..10.00 rows=10 width=112) (actual time=22.305..23.237 rows=1000 loops=1)
+ Planning Time: 0.349 ms
+ Execution Time: 390.797 ms
+(12 rows)
+Output Tuples: 1000
+
+
+
+
+===============================================================================
+TABLE PAIR 2: flights1 + flights2
+===============================================================================
+
+--- Version 1: Both Local ---
+EXPLAIN ANALYZE
+SELECT DISTINCT f1."FL_DATE", f1."DEP_DELAY", f1."ARR_DELAY"
+FROM flights1_pg f1
+LEFT JOIN flights2_pg f2
+  ON f1.index_column = f2.index_column
+WHERE f1.index_column < 1000;
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=27770.55..27876.99 rows=832 width=20) (actual time=56.753..58.050 rows=979 loops=1)
+   ->  Gather Merge  (cost=27770.55..27870.75 rows=832 width=20) (actual time=56.752..57.961 rows=986 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Unique  (cost=26770.53..26774.69 rows=416 width=20) (actual time=48.146..48.187 rows=329 loops=3)
+               ->  Sort  (cost=26770.53..26771.57 rows=416 width=20) (actual time=48.145..48.157 rows=333 loops=3)
+                     Sort Key: f1."FL_DATE", f1."DEP_DELAY", f1."ARR_DELAY"
+                     Sort Method: quicksort  Memory: 49kB
+                     Worker 0:  Sort Method: quicksort  Memory: 39kB
+                     Worker 1:  Sort Method: quicksort  Memory: 25kB
+                     ->  Parallel Hash Right Join  (cost=14621.53..26752.43 rows=416 width=20) (actual time=24.391..48.026 rows=333 loops=3)
+                           Hash Cond: (f2.index_column = f1.index_column)
+                           ->  Parallel Seq Scan on flights2_pg f2  (cost=0.00..10566.67 rows=416667 width=8) (actual time=0.021..15.571 rows=333333 loops=3)
+                           ->  Parallel Hash  (cost=14616.33..14616.33 rows=416 width=28) (actual time=12.191..12.191 rows=333 loops=3)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 72kB
+                                 ->  Parallel Seq Scan on flights1_pg f1  (cost=0.00..14616.33 rows=416 width=28) (actual time=5.536..12.115 rows=333 loops=3)
+                                       Filter: (index_column < 1000)
+                                       Rows Removed by Filter: 333000
+ Planning Time: 0.120 ms
+ Execution Time: 58.110 ms
+(20 rows)
+Output Tuples: 979
+
+
+--- Version 2: Both Foreign ---
+EXPLAIN ANALYZE
+SELECT DISTINCT f1."FL_DATE", f1."DEP_DELAY", f1."ARR_DELAY"
+FROM flights1 f1
+LEFT JOIN flights2 f2
+  ON f1.index_column = f2.index_column
+WHERE f1.index_column < 1000;
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Unique  (cost=10.00..10.07 rows=10 width=20) (actual time=27.928..29.802 rows=979 loops=1)
+   ->  Foreign Scan  (cost=10.00..10.00 rows=10 width=20) (actual time=27.925..29.674 rows=1000 loops=1)
+ Planning Time: 0.285 ms
+ Execution Time: 30.895 ms
+(4 rows)
+Output Tuples: 979
+
+
+--- Version 3: First Local, Second Foreign ---
+EXPLAIN ANALYZE
+SELECT DISTINCT f1."FL_DATE", f1."DEP_DELAY", f1."ARR_DELAY"
+FROM flights1_pg f1
+LEFT JOIN flights2 f2
+  ON f1.index_column = f2.index_column
+WHERE f1.index_column < 1000;
+                                                                       QUERY PLAN                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=18348.12..18358.11 rows=995 width=20) (actual time=36.239..36.406 rows=979 loops=1)
+   ->  Sort  (cost=18348.12..18350.62 rows=999 width=20) (actual time=36.238..36.324 rows=1000 loops=1)
+         Sort Key: f1."FL_DATE", f1."DEP_DELAY", f1."ARR_DELAY"
+         Sort Method: quicksort  Memory: 64kB
+         ->  Hash Right Join  (cost=15738.72..18298.35 rows=999 width=20) (actual time=35.698..36.133 rows=1000 loops=1)
+               Hash Cond: (f2.index_column = f1.index_column)
+               ->  Foreign Scan on flights2 f2  (cost=10.00..2560.00 rows=2560 width=8) (actual time=14.899..15.111 rows=1000 loops=1)
+               ->  Hash  (cost=15716.23..15716.23 rows=999 width=28) (actual time=20.792..20.847 rows=1000 loops=1)
+                     Buckets: 1024  Batches: 1  Memory Usage: 71kB
+                     ->  Gather  (cost=1000.00..15716.23 rows=999 width=28) (actual time=0.161..20.775 rows=1000 loops=1)
+                           Workers Planned: 2
+                           Workers Launched: 2
+                           ->  Parallel Seq Scan on flights1_pg f1  (cost=0.00..14616.33 rows=416 width=28) (actual time=5.264..12.064 rows=333 loops=3)
+                                 Filter: (index_column < 1000)
+                                 Rows Removed by Filter: 333000
+ Planning Time: 55.863 ms
+ Execution Time: 39.588 ms
+(17 rows)
+Output Tuples: 979
+
+
+--- Version 4: First Foreign, Second Local ---
+EXPLAIN ANALYZE
+SELECT DISTINCT f1."FL_DATE", f1."DEP_DELAY", f1."ARR_DELAY"
+FROM flights1 f1
+LEFT JOIN flights2_pg f2
+  ON f1.index_column = f2.index_column
+WHERE f1.index_column < 1000;
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=20183.94..20189.19 rows=192 width=20) (actual time=117.285..117.398 rows=979 loops=1)
+   ->  Sort  (cost=20183.94..20185.26 rows=525 width=20) (actual time=117.283..117.314 rows=1000 loops=1)
+         Sort Key: f1."FL_DATE", f1."DEP_DELAY", f1."ARR_DELAY"
+         Sort Method: quicksort  Memory: 64kB
+         ->  Hash Right Join  (cost=10.12..20160.22 rows=525 width=20) (actual time=20.476..117.094 rows=1000 loops=1)
+               Hash Cond: (f2.index_column = f1.index_column)
+               ->  Seq Scan on flights2_pg f2  (cost=0.00..16400.00 rows=1000000 width=8) (actual time=0.030..42.555 rows=1000000 loops=1)
+               ->  Hash  (cost=10.00..10.00 rows=10 width=28) (actual time=20.438..20.439 rows=1000 loops=1)
+                     Buckets: 1024  Batches: 1  Memory Usage: 71kB
+                     ->  Foreign Scan on flights1 f1  (cost=10.00..10.00 rows=10 width=28) (actual time=18.428..20.323 rows=1000 loops=1)
+ Planning Time: 0.330 ms
+ Execution Time: 118.761 ms
+(12 rows)
+Output Tuples: 979
+
+
+
+
+===============================================================================
+TABLE PAIR 3: yellow_tripdata1 + yellow_tripdata2
+===============================================================================
+
+--- Version 1: Both Local ---
+EXPLAIN ANALYZE
+SELECT DISTINCT y1."VendorID", y1.tpep_pickup_datetime, y1.trip_distance
+FROM yellow_tripdata1_pg y1
+LEFT JOIN yellow_tripdata2_pg y2
+  ON y1.index_column = y2.index_column
+WHERE y1.index_column < 1000;
+                                                                               QUERY PLAN                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=139228.14..139357.34 rows=1010 width=24) (actual time=184.097..185.241 rows=990 loops=1)
+   ->  Gather Merge  (cost=139228.14..139349.77 rows=1010 width=24) (actual time=184.097..185.153 rows=990 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Unique  (cost=138228.12..138233.17 rows=505 width=24) (actual time=174.964..175.005 rows=330 loops=3)
+               ->  Sort  (cost=138228.12..138229.38 rows=505 width=24) (actual time=174.964..174.976 rows=333 loops=3)
+                     Sort Key: y1."VendorID", y1.tpep_pickup_datetime, y1.trip_distance
+                     Sort Method: quicksort  Memory: 25kB
+                     Worker 0:  Sort Method: quicksort  Memory: 64kB
+                     Worker 1:  Sort Method: quicksort  Memory: 25kB
+                     ->  Parallel Hash Right Join  (cost=85837.05..138205.44 rows=505 width=24) (actual time=134.382..174.823 rows=333 loops=3)
+                           Hash Cond: (y2.index_column = y1.index_column)
+                           ->  Parallel Seq Scan on yellow_tripdata2_pg y2  (cost=0.00..46776.94 rows=1490494 width=8) (actual time=0.027..55.873 rows=1192514 loops=3)
+                           ->  Parallel Hash  (cost=85830.73..85830.73 rows=505 width=32) (actual time=53.260..53.261 rows=333 loops=3)
+                                 Buckets: 2048  Batches: 1  Memory Usage: 80kB
+                                 ->  Parallel Seq Scan on yellow_tripdata1_pg y1  (cost=0.00..85830.73 rows=505 width=32) (actual time=32.642..53.190 rows=333 loops=3)
+                                       Filter: (index_column < 1000)
+                                       Rows Removed by Filter: 1192181
+ Planning Time: 0.083 ms
+ Execution Time: 185.294 ms
+(20 rows)
+Output Tuples: 990
+
+
+--- Version 2: Both Foreign ---
+EXPLAIN ANALYZE
+SELECT DISTINCT y1."VendorID", y1.tpep_pickup_datetime, y1.trip_distance
+FROM yellow_tripdata1 y1
+LEFT JOIN yellow_tripdata2 y2
+  ON y1.index_column = y2.index_column
+WHERE y1.index_column < 1000;
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Unique  (cost=10.00..10.07 rows=10 width=24) (actual time=29.480..31.386 rows=990 loops=1)
+   ->  Foreign Scan  (cost=10.00..10.00 rows=10 width=24) (actual time=29.476..31.255 rows=1000 loops=1)
+ Planning Time: 0.142 ms
+ Execution Time: 32.627 ms
+(4 rows)
+Output Tuples: 990
+
+
+--- Version 3: First Local, Second Foreign ---
+EXPLAIN ANALYZE
+SELECT DISTINCT y1."VendorID", y1.tpep_pickup_datetime, y1.trip_distance
+FROM yellow_tripdata1_pg y1
+LEFT JOIN yellow_tripdata2 y2
+  ON y1.index_column = y2.index_column
+WHERE y1.index_column < 1000;
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=89997.37..90009.50 rows=1213 width=24) (actual time=66.428..67.507 rows=990 loops=1)
+   ->  Sort  (cost=89997.37..90000.40 rows=1213 width=24) (actual time=66.427..67.418 rows=1000 loops=1)
+         Sort Key: y1."VendorID", y1.tpep_pickup_datetime, y1.trip_distance
+         Sort Method: quicksort  Memory: 64kB
+         ->  Hash Left Join  (cost=3592.00..89935.24 rows=1213 width=24) (actual time=17.115..67.188 rows=1000 loops=1)
+               Hash Cond: (y1.index_column = y2.index_column)
+               ->  Gather  (cost=1000.00..86952.03 rows=1213 width=32) (actual time=0.170..50.131 rows=1000 loops=1)
+                     Workers Planned: 2
+                     Workers Launched: 2
+                     ->  Parallel Seq Scan on yellow_tripdata1_pg y1  (cost=0.00..85830.73 rows=505 width=32) (actual time=35.623..51.907 rows=333 loops=3)
+                           Filter: (index_column < 1000)
+                           Rows Removed by Filter: 1192181
+               ->  Hash  (cost=2560.00..2560.00 rows=2560 width=8) (actual time=16.939..16.940 rows=1000 loops=1)
+                     Buckets: 4096  Batches: 1  Memory Usage: 72kB
+                     ->  Foreign Scan on yellow_tripdata2 y2  (cost=10.00..2560.00 rows=2560 width=8) (actual time=16.605..16.823 rows=1000 loops=1)
+ Planning Time: 202.762 ms
+ Execution Time: 70.702 ms
+(17 rows)
+Output Tuples: 990
+
+
+--- Version 4: First Foreign, Second Local ---
+EXPLAIN ANALYZE
+SELECT DISTINCT y1."VendorID", y1.tpep_pickup_datetime, y1.trip_distance
+FROM yellow_tripdata1 y1
+LEFT JOIN yellow_tripdata2_pg y2
+  ON y1.index_column = y2.index_column
+WHERE y1.index_column < 1000;
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=81090.27..81095.14 rows=190 width=24) (actual time=368.185..368.299 rows=990 loops=1)
+   ->  Sort  (cost=81090.27..81091.49 rows=487 width=24) (actual time=368.184..368.215 rows=1000 loops=1)
+         Sort Key: y1."VendorID", y1.tpep_pickup_datetime, y1.trip_distance
+         Sort Method: quicksort  Memory: 64kB
+         ->  Hash Right Join  (cost=10.12..81068.53 rows=487 width=24) (actual time=17.261..367.986 rows=1000 loops=1)
+               Hash Cond: (y2.index_column = y1.index_column)
+               ->  Seq Scan on yellow_tripdata2_pg y2  (cost=0.00..67643.86 rows=3577186 width=8) (actual time=0.036..158.696 rows=3577543 loops=1)
+               ->  Hash  (cost=10.00..10.00 rows=10 width=32) (actual time=17.214..17.215 rows=1000 loops=1)
+                     Buckets: 1024  Batches: 1  Memory Usage: 71kB
+                     ->  Foreign Scan on yellow_tripdata1 y1  (cost=10.00..10.00 rows=10 width=32) (actual time=15.200..17.096 rows=1000 loops=1)
+ Planning Time: 0.155 ms
+ Execution Time: 369.298 ms
+(12 rows)
+Output Tuples: 990
+
+
+
+
+===============================================================================
+TABLE PAIR 4: citations_bulk_table1 + citations_bulk_table2
+===============================================================================
+
+--- Version 1: Both Local ---
+EXPLAIN ANALYZE
+SELECT DISTINCT t1.citationid, t1.citingcorpusid, t1.citedcorpusid, t1.isinfluential
+FROM citations_bulk_table1_pg t1
+LEFT JOIN citations_bulk_table2_pg t2
+  ON t1.citationid = t2.citationid
+WHERE t1.citationid < 1000000;
+                                                                                  QUERY PLAN                                                                                   
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=324571.82..324767.22 rows=1484 width=25) (actual time=632.479..633.928 rows=2113 loops=1)
+   ->  Gather Merge  (cost=324571.82..324752.38 rows=1484 width=25) (actual time=632.478..633.708 rows=2113 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Unique  (cost=323571.79..323581.07 rows=742 width=25) (actual time=623.757..623.870 rows=704 loops=3)
+               ->  Sort  (cost=323571.79..323573.65 rows=742 width=25) (actual time=623.756..623.798 rows=704 loops=3)
+                     Sort Key: t1.citationid, t1.citingcorpusid, t1.citedcorpusid, t1.isinfluential
+                     Sort Method: quicksort  Memory: 58kB
+                     Worker 0:  Sort Method: quicksort  Memory: 56kB
+                     Worker 1:  Sort Method: quicksort  Memory: 58kB
+                     ->  Parallel Hash Right Join  (cost=164827.62..323536.42 rows=742 width=25) (actual time=145.256..623.512 rows=704 loops=3)
+                           Hash Cond: (t2.citationid = t1.citationid)
+                           ->  Parallel Seq Scan on citations_bulk_table2_pg t2  (cost=0.00..138060.88 rows=5505288 width=8) (actual time=0.024..197.329 rows=4404419 loops=3)
+                           ->  Parallel Hash  (cost=164818.35..164818.35 rows=742 width=25) (actual time=143.684..143.684 rows=704 loops=3)
+                                 Buckets: 2048  Batches: 1  Memory Usage: 208kB
+                                 ->  Parallel Seq Scan on citations_bulk_table1_pg t1  (cost=0.00..164818.35 rows=742 width=25) (actual time=0.221..143.498 rows=704 loops=3)
+                                       Filter: (citationid < 1000000)
+                                       Rows Removed by Filter: 4403714
+ Planning Time: 0.125 ms
+ Execution Time: 634.023 ms
+(20 rows)
+Output Tuples: 2113
+
+
+--- Version 2: Both Foreign ---
+EXPLAIN ANALYZE
+SELECT DISTINCT t1.citationid, t1.citingcorpusid, t1.citedcorpusid, t1.isinfluential
+FROM citations_bulk_table1 t1
+LEFT JOIN citations_bulk_table2 t2
+  ON t1.citationid = t2.citationid
+WHERE t1.citationid < 1000000;
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Unique  (cost=10.00..10.10 rows=10 width=25) (actual time=93.968..96.837 rows=2113 loops=1)
+   ->  Foreign Scan  (cost=10.00..10.00 rows=10 width=25) (actual time=93.965..96.527 rows=2113 loops=1)
+ Planning Time: 0.163 ms
+ Execution Time: 98.106 ms
+(4 rows)
+Output Tuples: 2113
+
+
+
+--- Version 3: First Local, Second Foreign ---
+EXPLAIN ANALYZE
+SELECT DISTINCT t1.citationid, t1.citingcorpusid, t1.citedcorpusid, t1.isinfluential
+FROM citations_bulk_table1_pg t1
+LEFT JOIN citations_bulk_table2 t2
+  ON t1.citationid = t2.citationid
+WHERE t1.citationid < 1000000;
+                                                                            QUERY PLAN                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=168558.67..168801.04 rows=1780 width=25) (actual time=184.294..185.272 rows=2113 loops=1)
+   ->  Merge Left Join  (cost=168558.67..168783.24 rows=1780 width=25) (actual time=184.293..185.046 rows=2113 loops=1)
+         Merge Cond: (t1.citationid = t2.citationid)
+         ->  Gather Merge  (cost=165853.75..166061.06 rows=1780 width=25) (actual time=153.275..153.598 rows=2113 loops=1)
+               Workers Planned: 2
+               Workers Launched: 2
+               ->  Sort  (cost=164853.72..164855.58 rows=742 width=25) (actual time=144.362..144.408 rows=704 loops=3)
+                     Sort Key: t1.citationid, t1.citingcorpusid, t1.citedcorpusid, t1.isinfluential
+                     Sort Method: quicksort  Memory: 60kB
+                     Worker 0:  Sort Method: quicksort  Memory: 57kB
+                     Worker 1:  Sort Method: quicksort  Memory: 55kB
+                     ->  Parallel Seq Scan on citations_bulk_table1_pg t1  (cost=0.00..164818.35 rows=742 width=25) (actual time=0.313..144.165 rows=704 loops=3)
+                           Filter: (citationid < 1000000)
+                           Rows Removed by Filter: 4403714
+         ->  Sort  (cost=2704.92..2711.32 rows=2560 width=8) (actual time=31.011..31.077 rows=2113 loops=1)
+               Sort Key: t2.citationid
+               Sort Method: quicksort  Memory: 97kB
+               ->  Foreign Scan on citations_bulk_table2 t2  (cost=10.00..2560.00 rows=2560 width=8) (actual time=30.323..30.807 rows=2113 loops=1)
+ Planning Time: 559.968 ms
+ Execution Time: 192.481 ms
+(20 rows)
+Output Tuples: 2113
+
+
+
+--- Version 4: First Foreign, Second Local ---
+EXPLAIN ANALYZE
+SELECT DISTINCT t1.citationid, t1.citingcorpusid, t1.citedcorpusid, t1.isinfluential
+FROM citations_bulk_table1 t1
+LEFT JOIN citations_bulk_table2_pg t2
+  ON t1.citationid = t2.citationid
+WHERE t1.citationid < 1000000;
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+WARNING:  Current Sqlite Version (10103) does not support NULLS LAST for ORDER BY ASC, degraded emitted query to ORDER BY ASC NULLS FIRST (default sqlite behaviour).
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=264718.12..264725.08 rows=386 width=25) (actual time=1346.657..1346.993 rows=2113 loops=1)
+   ->  Sort  (cost=264718.12..264719.51 rows=557 width=25) (actual time=1346.655..1346.780 rows=2113 loops=1)
+         Sort Key: t1.citationid, t1.citingcorpusid, t1.citedcorpusid, t1.isinfluential
+         Sort Method: quicksort  Memory: 195kB
+         ->  Hash Right Join  (cost=10.12..264692.71 rows=557 width=25) (actual time=74.576..1346.081 rows=2113 loops=1)
+               Hash Cond: (t2.citationid = t1.citationid)
+               ->  Seq Scan on citations_bulk_table2_pg t2  (cost=0.00..215134.90 rows=13212690 width=8) (actual time=0.044..565.591 rows=13213256 loops=1)
+               ->  Hash  (cost=10.00..10.00 rows=10 width=25) (actual time=74.507..74.508 rows=2113 loops=1)
+                     Buckets: 4096 (originally 1024)  Batches: 1 (originally 1)  Memory Usage: 149kB
+                     ->  Foreign Scan on citations_bulk_table1 t1  (cost=10.00..10.00 rows=10 width=25) (actual time=71.752..74.200 rows=2113 loops=1)
+ Planning Time: 0.243 ms
+ Execution Time: 1347.996 ms
+(12 rows)
+Output Tuples: 2113

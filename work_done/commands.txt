@@ -1,0 +1,6 @@
+~/Desktop/assignments/DBMS/Project_test/postgresql/install/bin/pg_ctl -D ~/Desktop/assignments/DBMS/Project_test/pgdata start
+
+~/Desktop/assignments/DBMS/Project_test/postgresql/install/bin/psql -d postgres
+
+~/Desktop/assignments/DBMS/Project_test/duckdb/build/release/duckdb /home/neel/Desktop/assignments/DBMS/Project_test/duckdb_fdw/test.duckdb
+
