@@ -76,6 +76,9 @@ static void duckdb_fdw_exit(int code, Datum arg);
 
 PG_MODULE_MAGIC;
 
+/* GUC variable to enable/disable join pushdown optimization */
+static bool enable_join_pushdown = false;
+
 /* The number of default estimated rows for table which does not exist in sqlite1_stat1
  * See sqlite3ResultSetOfSelect in select.c of SQLite
  */
@@ -447,6 +450,18 @@ typedef struct
  */
 void _PG_init(void)
 {
+	/* Define GUC variable for join pushdown optimization */
+	DefineCustomBoolVariable("duckdb_fdw.enable_join_pushdown",
+							 "Enable join pushdown optimization for SEMIJOIN, INNER, LEFT, RIGHT, FULL OUTER joins.",
+							 "When enabled, filtered join keys from local tables are pushed to foreign tables as WHERE IN clauses.",
+							 &enable_join_pushdown,
+							 false,  /* default value: disabled (base code behavior) */
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+	
 	on_proc_exit(&duckdb_fdw_exit, PointerGetDatum(NULL));
 }
 
@@ -1868,6 +1883,23 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 	elog(DEBUG1, "duckdb_fdw : %s", __func__);
 
 	/*
+	 * JOIN PUSHDOWN OPTIMIZATION
+	 * 
+	 * Check if optimization is enabled via GUC parameter:
+	 *   SET duckdb_fdw.enable_join_pushdown = true;
+	 * 
+	 * When disabled (default), skip all join optimization code and use base behavior.
+	 * When enabled, detect and optimize SEMIJOIN, OUTER JOIN, and INNER JOIN queries.
+	 */
+	if (!enable_join_pushdown)
+	{
+		elog(DEBUG1, "Join pushdown optimization DISABLED (use SET duckdb_fdw.enable_join_pushdown = true to enable)");
+		goto skip_join_optimization;
+	}
+	
+	elog(DEBUG1, "Join pushdown optimization ENABLED");
+
+	/*
 	 * Detect if this foreign scan is part of a semijoin.
 	 * If the foreign table is on the inner side of a semijoin, we can
 	 * potentially push down the filtering to DuckDB using WHERE IN.
@@ -2530,6 +2562,7 @@ sqliteGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 		}
 	}
 
+skip_join_optimization:
 	/* Decide to execute function pushdown support in the target list. */
 	fpinfo->is_tlist_func_pushdown = sqlite_is_foreign_function_tlist(root, baserel, tlist);
 
@@ -4964,12 +4997,22 @@ sqlite_foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype
 	List *joinclauses;
 
 	/*
-	 * We support pushing down INNER, LEFT, and SEMI joins.
-	 * SEMI joins are particularly important for performance when both
-	 * tables are foreign - they can be translated to EXISTS or IN queries.
+	 * We support pushing down INNER, LEFT, and optionally SEMI joins.
+	 * SEMI joins are only supported when join pushdown optimization is enabled.
+	 * When disabled, use base code behavior (INNER and LEFT only).
 	 */
-	if (jointype != JOIN_INNER && jointype != JOIN_LEFT && jointype != JOIN_SEMI)
-		return false;
+	if (enable_join_pushdown)
+	{
+		/* With optimization enabled: support INNER, LEFT, and SEMI joins */
+		if (jointype != JOIN_INNER && jointype != JOIN_LEFT && jointype != JOIN_SEMI)
+			return false;
+	}
+	else
+	{
+		/* Base code behavior: only INNER and LEFT joins */
+		if (jointype != JOIN_INNER && jointype != JOIN_LEFT)
+			return false;
+	}
 
 	/*
 	 * If either of the joining relations is marked as unsafe to pushdown, the
