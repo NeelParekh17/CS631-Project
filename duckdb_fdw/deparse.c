@@ -3399,6 +3399,8 @@ sqlite_append_agg_order_by(List *orderList, List *targetList, deparse_expr_cxt *
  * Deparse ORDER BY clause according to the given pathkeys for given base
  * relation. From given pathkeys expressions belonging entirely to the given
  * base relation are obtained and deparsed.
+ * 
+ * Not relevant to existing codebase i was working on it but out of scope of project
  */
 static void
 sqlite_append_order_by_clause(List *pathkeys, bool has_final_sort, deparse_expr_cxt *context)
